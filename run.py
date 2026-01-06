@@ -13,7 +13,7 @@ from DataSet import *
 import sys
 
 parser = argparse.ArgumentParser()
-parser.add_argument('-dataset_name', default='christianity')
+parser.add_argument('-dataset_name', default='android')
 parser.add_argument('-epoch', default=50)
 parser.add_argument('-batch_size', default=64)
 parser.add_argument('-emb_dim', default=64)
