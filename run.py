@@ -13,8 +13,8 @@ from Module import RLCascadeModel
 from DataSet import *
 
 parser = argparse.ArgumentParser()
-parser.add_argument('-dataset_name', default='android')
-parser.add_argument('-epoch', default=100, type=int)
+parser.add_argument('-dataset_name', default='memetracker')
+parser.add_argument('-epoch', default=50, type=int)
 parser.add_argument('-batch_size', default=64, type=int)
 parser.add_argument('-emb_dim', default=64, type=int)
 parser.add_argument('-hidden_dim', default=64, type=int)
