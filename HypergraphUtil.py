@@ -18,10 +18,10 @@ def RelationGraph(data_name, device):
     if os.path.exists(data.net_data):
         with open(data.net_data, 'r') as f:
             edge_list = f.read().strip().split('\n')
-            if data_name == 'douban' or data_name == 'twitter' or data_name == 'android':
-                edge_list = [edge.split(',') for edge in edge_list]
-            else:
+            if data_name == 'christianity':
                 edge_list = [edge.split(' ') for edge in edge_list]
+            else:
+                edge_list = [edge.split(',') for edge in edge_list]
 
             edge_list = [(_u2idx[edge[0]], _u2idx[edge[1]]) for edge in edge_list \
                          if edge[0] in _u2idx and edge[1] in _u2idx]

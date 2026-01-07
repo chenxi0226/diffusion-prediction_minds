@@ -12,7 +12,7 @@ import pickle
 class Options(object):
 
     def __init__(self, data_name='douban'):
-        self.data = 'data/' + data_name + '/cascades.txt'
+        self.data = 'data/' + data_name + '/cascades_raw.txt'
         self.u2idx_dict = 'data/' + data_name + '/u2idx.pickle'
         self.idx2u_dict = 'data/' + data_name + '/idx2u.pickle'
         self.save_path = ''
@@ -137,27 +137,48 @@ def SplitData(data_name, train_rate=0.8, valid_rate=0.1, random_seed=300, load_d
 
 def buildIndex(data):
     user_set = set()  # 用户集合
-    u2idx = {}  # u2idx[user]=pos pos是用户的编号，user是用户
+    u2idx = {}  # u2idx[user]=pos
     idx2u = []  # idx2u[pos]=user
 
     lineid = 0
+    # 自动判断是否是 memetracker 数据（根据路径或文件名）
+    is_memetracker = 'memetracker' in data
+
     for line in open(data):
         lineid += 1
         if len(line.strip()) == 0:
             continue
-        chunks = line.strip().split(',')
+
+        # --- 修改点 1: 根据数据集类型选择切分符 ---
+        if is_memetracker:
+            chunks = line.strip().split()  # Memetracker 用空格分块
+        else:
+            chunks = line.strip().split(',')  # 其他用逗号分块
+
         for chunk in chunks:
+            user = None  # 初始化 user 防止报错
             try:
-                if len(chunk.split()) == 2:
+                # --- 修改点 2: 增加对 u,t 格式的兼容 ---
+                # 情况 A: 也就是 Memetracker (user,timestamp)
+                if ',' in chunk and len(chunk.split(',')) == 2:
+                    user, timestamp = chunk.split(',')
+
+                # 情况 B: 原有逻辑 (user timestamp)
+                elif len(chunk.split()) == 2:
                     user, timestamp = chunk.split()
+
+                # 情况 C: 原有逻辑 (root user timestamp)
                 elif len(chunk.split()) == 3:
                     root, user, timestamp = chunk.split()
                     user_set.add(root)
+
             except:
-                print(line)
-                print(chunk)
-                print(lineid)
-            user_set.add(user)
+                print(f"Error line {lineid}: {chunk}")
+
+            # --- 修改点 3: 只有 user 被成功赋值才加入集合 ---
+            if user is not None:
+                user_set.add(user)
+
     pos = 0
     u2idx['<blank>'] = pos
     idx2u.append('<blank>')
@@ -173,7 +194,6 @@ def buildIndex(data):
     user_size = len(user_set) + 2
     print("user_size : %d" % (user_size))
     return user_size, u2idx, idx2u
-
 
 class DataLoader(object):
     ''' For data iteration '''
