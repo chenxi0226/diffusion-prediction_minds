@@ -3,7 +3,247 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.init as init
+import torch.nn.functional as F
+from torch.distributions import Categorical
 from Layer import *
+
+class StructureAwareQCritic(nn.Module):
+    """
+    输入:
+      1. state_emb: SharedLSTM 输出的隐向量 (体现时序和语义)
+      2. action_emb: 候选动作的 Embedding
+      3. explicit_feats: [Connectivity_Score, Is_Infected] (体现拓扑因果性)
+    输出:
+      Q(s, a) 标量, 评估在状态 s 下采取动作 a (选择特定用户) 的价值。
+    """
+    def __init__(self, state_dim, action_dim, hidden_dim=64):
+        super(StructureAwareQCritic, self).__init__()
+        # 输入维度 = 状态维度 + 动作维度 + 2个显式特征
+        self.input_dim = state_dim + action_dim + 2
+
+        self.net = nn.Sequential(
+            nn.Linear(self.input_dim, hidden_dim),
+            nn.LeakyReLU(0.2),  # LeakyRLU 对稀疏信号更友好
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1)  # Output Q-Value
+        )
+        self.init_weights()
+
+    def init_weights(self):
+        for m in self.net:
+            if isinstance(m, nn.Linear):
+                init.xavier_normal_(m.weight)
+
+    def forward(self, state_emb, action_emb, explicit_feats):
+        # state_emb: [B, D]
+        # action_emb: [B, D]
+        # explicit_feats: [B, 2]
+        x = torch.cat([state_emb, action_emb, explicit_feats], dim=-1)
+        return self.net(x)
+
+
+class RL_MINDS_StructureAware(nn.Module):
+    def __init__(self, user_size, embed_dim, step_split=8, max_seq_len=200, device=torch.device('cuda')):
+        super(RL_MINDS_StructureAware, self).__init__()
+        self.user_size = user_size
+        self.emb_dim = embed_dim
+        self.device = device
+
+        # --- Encoders ---
+        self.dycasHGNN = DynamicCasHGNN(user_size, embed_dim, step_split)
+        self.relationGNN = RelationGNN(user_size, embed_dim)
+        self.relationLSTM = RelationLSTM(embed_dim)
+        self.cascadeLSTM = CascadeLSTM(embed_dim)
+        self.sharedLSTM = SharedLSTM(max_seq_len, embed_dim)
+
+        # --- Embeddings & Projections ---
+        self.user_embedding = nn.Embedding(user_size, embed_dim)
+        self.W_micro = nn.Linear(embed_dim, embed_dim)
+        self.W_macro = nn.Linear(embed_dim, embed_dim)
+
+        # --- Heads ---
+        self.actor_head = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.Tanh(),
+            nn.Linear(embed_dim, user_size)
+        )
+
+        # Critic 输入维度需匹配
+        self.critic = StructureAwareQCritic(state_dim=embed_dim, action_dim=embed_dim)
+
+        self.macro_head = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim // 2),
+            nn.ReLU(),
+            nn.Linear(embed_dim // 2, 1)
+        )
+
+        self.adj_matrix = None
+        self.init_weights()
+
+    def init_weights(self):
+        init.xavier_normal_(self.W_micro.weight)
+        init.xavier_normal_(self.W_macro.weight)
+        init.xavier_normal_(self.user_embedding.weight)
+
+    def set_adjacency_matrix(self, relation_graph):
+        if self.adj_matrix is not None: return
+        try:
+            # 1. 获取 raw 数据
+            # 报错显示 relation_graph.e[0] 是 [E, 2]，说明它包含了完整的边信息
+            raw_data = relation_graph.e
+
+            src, dst = None, None
+
+            # 情况 A: 如果是元组 (Edges, Weights)
+            if isinstance(raw_data, tuple):
+                # 通常第一个元素是边索引
+                edges = raw_data[0]
+            else:
+                edges = raw_data
+
+            # 2. 统一转为 Tensor 并移动到设备
+            if not isinstance(edges, torch.Tensor):
+                edges = torch.tensor(edges, dtype=torch.long)
+            edges = edges.to(self.device)
+
+            # 3. 根据形状解析 src, dst
+            # 如果形状是 [E, 2] -> 每一行是 (u, v)
+            if edges.dim() == 2 and edges.shape[1] == 2:
+                src = edges[:, 0]
+                dst = edges[:, 1]
+            # 如果形状是 [2, E] -> 第一行是 u, 第二行是 v
+            elif edges.dim() == 2 and edges.shape[0] == 2:
+                src = edges[0]
+                dst = edges[1]
+            # 如果原本就是 tuple(src, dst) 且被我们误判了，再尝试解包
+            elif isinstance(raw_data, tuple) and len(raw_data) == 2 and edges.dim() == 1:
+                src = raw_data[0].to(self.device).long()
+                dst = raw_data[1].to(self.device).long()
+            else:
+                raise ValueError(f"Unexpected edge shape: {edges.shape}")
+
+            # 4. 构建稀疏矩阵
+            # 确保 src, dst 都是 1D Tensor
+            src = src.contiguous().view(-1)
+            dst = dst.contiguous().view(-1)
+
+            indices = torch.stack([src, dst], dim=0)
+            values = torch.ones(src.size(0)).to(self.device)
+
+            self.adj_matrix = torch.sparse_coo_tensor(
+                indices, values, (self.user_size, self.user_size)
+            ).to(self.device)
+
+            # print(f"✅ Adjacency Matrix built. Edges: {src.size(0)}")
+
+        except Exception as e:
+            print(f"⚠️ Warning: Failed to build adjacency matrix: {e}")
+            # Fallback
+            self.adj_matrix = torch.sparse_coo_tensor(
+                torch.empty(2, 0).long().to(self.device),
+                torch.empty(0).to(self.device),
+                (self.user_size, self.user_size)
+            )
+
+    def lookup_embedding(self, examples, embeddings):
+        # 限制 index 范围防止越界
+        examples = torch.clamp(examples, 0, embeddings.size(0) - 1)
+        return F.embedding(examples, embeddings)
+
+    def get_shared_state(self, graph_list, relation_graph, examples):
+        # 1. 全局图特征 (Batch无关)
+        user_cas_embedding = self.dycasHGNN(graph_list, self.device)  # [User, D]
+        user_social_embedding = self.relationGNN(relation_graph)  # [User, D]
+
+        # 2. Batch 序列特征
+        sender_social_embedding = self.relationLSTM(examples, user_social_embedding)
+
+        # lookup 将全局特征映射到当前 Batch
+        sender_cas_embedding_share = self.lookup_embedding(examples, user_cas_embedding)
+        sender_social_embedding_share = self.lookup_embedding(examples, user_social_embedding)
+
+        # 3. 融合
+        shared_embedding, _ = self.sharedLSTM(sender_cas_embedding_share, sender_social_embedding_share)
+
+        return shared_embedding, user_social_embedding
+
+    def compute_explicit_features(self, current_seq, action_candidates):
+        batch_size = current_seq.size(0)
+
+        # 1. Connectivity (稀疏矩阵乘法)
+        seq_multi_hot = torch.zeros(batch_size, self.user_size, device=self.device)
+        seq_multi_hot.scatter_(1, current_seq, 1.0)
+        seq_multi_hot[:, 0] = 0  # Mask PAD
+
+        if self.adj_matrix is not None:
+            # [User, User] @ [User, B] -> [User, B] -> [B, User]
+            all_connectivity = torch.sparse.mm(self.adj_matrix, seq_multi_hot.t()).t()
+            # Gather specific action
+            chosen_connectivity = all_connectivity.gather(1, action_candidates.unsqueeze(1))
+            seq_lens = (current_seq != 0).sum(dim=1, keepdim=True).float() + 1e-5
+            feature_connect = chosen_connectivity / seq_lens
+        else:
+            feature_connect = torch.zeros(batch_size, 1, device=self.device)
+
+        # 2. Is Infected
+        is_infected = (current_seq == action_candidates.unsqueeze(1)).any(dim=1).float().unsqueeze(1)
+
+        return torch.cat([feature_connect, is_infected], dim=-1)
+
+    def forward_step(self, graph_list, relation_graph, current_seq):
+        """RL Rollout 接口"""
+        if self.adj_matrix is None:
+            self.set_adjacency_matrix(relation_graph)
+
+        shared_emb, graph_emb = self.get_shared_state(graph_list, relation_graph, current_seq)
+        s_t = shared_emb[:, -1, :]  # Last Step
+
+        s_micro = torch.tanh(self.W_micro(s_t))
+        s_macro = torch.tanh(self.W_macro(s_t))
+
+        logits = self.actor_head(s_micro)
+        pred_size = self.macro_head(s_macro)
+
+        return logits, pred_size, s_micro, graph_emb
+
+    def get_q_value(self, s_micro, action, graph_emb, current_seq):
+        """
+        Critic 闭环接口:
+        s_micro: State [B, D]
+        action: Action Index [B]
+        graph_emb: 全图 Embedding [User, D] (用于查找 Action 的向量表示)
+        """
+        # 1. Action Embedding Lookup
+        a_emb = F.embedding(action, graph_emb)
+
+        # 2. Explicit Features
+        explicit_feats = self.compute_explicit_features(current_seq, action)
+
+        # 3. Q-Net
+        return self.critic(s_micro, a_emb, explicit_feats)
+
+    def forward(self, graph_list, relation_graph, examples):
+        shared_emb, _ = self.get_shared_state(graph_list, relation_graph, examples)
+
+        s_micro = torch.tanh(self.W_micro(shared_emb))
+        s_macro = torch.tanh(self.W_macro(shared_emb))
+
+        actor_logits = self.actor_head(s_micro)
+
+        # Macro Pooling
+        batch_size = examples.size(0)
+        example_len = torch.count_nonzero(examples, 1)
+        s_macro_last = []
+        for i in range(batch_size):
+            idx = example_len[i] - 1
+            if idx < 0: idx = 0
+            s_macro_last.append(s_macro[i, idx, :])
+        s_macro_last = torch.stack(s_macro_last, dim=0)
+
+        pred_macro = self.macro_head(s_macro_last)
+
+        return actor_logits, pred_macro
 
 class RelationGNN(nn.Module):
     '''社交图GNN'''
@@ -268,100 +508,3 @@ class MLP(nn.Module):
         out = self.linear3(out)
 
         return out
-
-
-class Module(nn.Module):
-    def __init__(self, user_size, embed_dim, step_split=8, max_seq_len=200, task_num=2, device=torch.device('cuda')):
-        '''
-        :param user_size: 数据集中的用户个数
-        :param embed_dim: embedding的维度
-        :param step_split: 分割的超图数量
-        :param max_seq_len: 级联序列的长度
-        '''
-        super().__init__()
-        self.user_size = user_size
-        self.emb_dim = embed_dim
-        self.step_split = step_split
-        self.max_seq_len = max_seq_len
-        self.device = device
-        self.task_num = task_num
-        self.task_label = torch.LongTensor([i for i in range(self.task_num)])
-        self.dycasHGNN = DynamicCasHGNN(self.user_size, self.emb_dim, self.step_split)   # HGNN
-        self.relationGNN = RelationGNN(self.user_size, self.emb_dim)    # GNN
-        self.relationLSTM = RelationLSTM(self.emb_dim)
-        self.cascadeLSTM = CascadeLSTM(self.emb_dim)
-        self.sharedLSTM = SharedLSTM(self.max_seq_len, self.emb_dim)
-        self.shared_linear = LinearLayer(self.emb_dim, self.task_num)   # 判别器
-        self.micro_mlp = MLP(self.emb_dim*2, self.emb_dim*4, self.user_size)
-        self.macro_mlp = MLP(self.emb_dim*2, self.emb_dim*4, 1)
-        # print('初始化方法')
-        self.user_embedding = nn.Embedding(self.user_size, self.emb_dim)  # 用户的初始特征
-        self.init_weights()
-
-    def init_weights(self):
-        stdv = 1.0 / math.sqrt(self.emb_dim)
-        for weight in self.parameters():
-            weight.data.uniform_(-stdv, stdv)
-
-    def lookup_embedding(self, examples, embeddings):
-        output_embedding = []
-        for example in examples:
-            index = example.clone().detach()
-            temp = torch.index_select(embeddings, dim=0, index=index)
-            output_embedding.append(temp)
-        output_embedding = torch.stack(output_embedding, 0)
-        return output_embedding
-
-    def adversarial_loss(self, shared_embedding):
-        logits, loss_l2 = self.shared_linear(shared_embedding, self.device)
-        # label = nn.functional.one_hot(self.task_label, self.task_num).to(self.device)
-        loss_adv = torch.zeros(logits.shape[0], device=self.device)
-        for task in range(self.task_num):
-            label = torch.tensor([task]*logits.shape[0]).to(self.device)
-            loss_adv += torch.nn.CrossEntropyLoss(reduce=False)(logits, label.long())
-
-        loss_adv = torch.mean(loss_adv)
-
-        return loss_adv, loss_l2
-
-    def diff_loss(self, shared_embedding, task_embedding):
-        shared_embedding -= torch.mean(shared_embedding, 0)
-        task_embedding -= torch.mean(task_embedding, 0)
-
-        # p=2时是l2正则
-        shared_embedding = nn.functional.normalize(shared_embedding, dim=1, p=2)
-        task_embedding = nn.functional.normalize(task_embedding, dim=1, p=2)
-
-        correlation_matrix = task_embedding.t() @ shared_embedding
-        loss_diff = torch.mean(torch.square_(correlation_matrix)) * 0.01
-        loss_diff = torch.where(loss_diff > 0, loss_diff, 0)
-        return loss_diff
-
-    def forward(self, graph_list, relation_graph, examples):
-        # print('执行过程')
-        user_cas_embedding = self.dycasHGNN(graph_list, self.device)
-        user_social_embedding = self.relationGNN(relation_graph)
-        sender_social_embedding = self.relationLSTM(examples, user_social_embedding)
-        sender_cas_embedding = self.cascadeLSTM(examples, user_cas_embedding)  # H^cas     (batch_size, 200, emb_dim)
-        sender_cas_embedding_share = self.lookup_embedding(examples, user_cas_embedding)
-        sender_social_embedding_share = self.lookup_embedding(examples, user_social_embedding)
-        shared_embedding, _ = self.sharedLSTM(sender_cas_embedding_share, sender_social_embedding_share)
-        example_len = torch.count_nonzero(examples, 1)  # 统计每个观察到的级联的长度，去掉用户0   (batch_size, 1)
-        batch_size, seq_len, emb_dim = shared_embedding.size()
-        H_user = []
-        H_cas = []
-        H_share = []
-        for i in range(batch_size):
-            H_user.append(sender_social_embedding[i, example_len[i] - 1, :])
-            H_cas.append(sender_cas_embedding[i, example_len[i] - 1, :])
-            H_share.append(shared_embedding[i, example_len[i]-1, :])
-        H_user = torch.stack(H_user, dim=0) # (batch_size, emb_dim)
-        H_cas = torch.stack(H_cas, dim=0)   # (batch_size, emb_dim)
-        H_share = torch.stack(H_share, dim=0)   # (batch_size, emb_dim)
-        pred_micro = self.micro_mlp(torch.concat((sender_social_embedding, shared_embedding), dim=2))   # (batch_size, 200, emb_dim)
-        pred_macro = self.macro_mlp(torch.concat((H_cas, H_share), dim=1))  # 每条级联的最终长度
-        loss_adv, _ = self.adversarial_loss(H_share)
-        loss_diff_micro = self.diff_loss(H_share, H_user)
-        loss_diff_macro = self.diff_loss(H_share, H_cas)
-        loss_diff = loss_diff_micro + loss_diff_macro
-        return pred_micro, pred_macro, loss_adv.item(), loss_diff.item()

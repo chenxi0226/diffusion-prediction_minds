@@ -92,27 +92,24 @@ def SplitData(data_name, train_rate=0.8, valid_rate=0.1, random_seed=300, load_d
     train_t = timestamps[0:train_idx_]
     train_idx = cas_idx[0:train_idx_]
     # train_len = t_cas_len[0:train_idx_]
+    shuffer_indices = list(range(len(train_idx)))
+    random.seed(random_seed)
+    random.shuffle(shuffer_indices)
+    train = [train[i] for i in shuffer_indices]
+    train_t = [train_t[i] for i in shuffer_indices]
+    train_idx = [train_idx[i] for i in shuffer_indices]
     train = [train, train_t, train_idx]
 
     valid_idx_ = int((train_rate + valid_rate) * len(t_cascades))
     valid = t_cascades[train_idx_:valid_idx_]
     valid_t = timestamps[train_idx_:valid_idx_]
     valid_idx = cas_idx[train_idx_:valid_idx_]
-    # valid_len = t_cas_len[train_idx_:valid_idx_]
     valid = [valid, valid_t, valid_idx]
 
     test = t_cascades[valid_idx_:]
     test_t = timestamps[valid_idx_:]
     test_idx = cas_idx[valid_idx_:]
-    # test_len = t_cas_len[valid_idx_:]
     test = [test, test_t, test_idx]
-
-    random.seed(random_seed)
-    random.shuffle(train)  # random.shuffle() 将一个列表中的元素打乱，但不会产生新的列表
-    random.seed(random_seed)
-    random.shuffle(train_t)
-    random.seed(random_seed)
-    random.shuffle(train_idx)
 
     total_len = sum(len(i) - 1 for i in t_cascades)
     train_size = len(train_t)
