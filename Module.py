@@ -71,6 +71,11 @@ class RL_MINDS_StructureAware(nn.Module):
 
         # Critic 输入维度需匹配
         self.critic = StructureAwareQCritic(state_dim=embed_dim, action_dim=embed_dim)
+        from copy import deepcopy
+        self.critic_target = deepcopy(self.critic)
+        for p in self.critic_target.parameters():
+            p.requires_grad = False
+        self.tau = 0.0005
 
         self.macro_head = nn.Sequential(
             nn.Linear(embed_dim, embed_dim // 2),
@@ -85,6 +90,10 @@ class RL_MINDS_StructureAware(nn.Module):
         init.xavier_normal_(self.W_micro.weight)
         init.xavier_normal_(self.W_macro.weight)
         init.xavier_normal_(self.user_embedding.weight)
+
+    def soft_update_target(self):
+        for parm, target_parm in zip(self.critic.parameters(), self.critic_target.parameters()):
+            target_parm.data.copy_(parm.data * self.tau + (1.0 - self.tau) * target_parm.data)
 
     def set_adjacency_matrix(self, relation_graph):
         if self.adj_matrix is not None: return

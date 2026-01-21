@@ -15,7 +15,7 @@ import sys
 
 parser = argparse.ArgumentParser()
 parser.add_argument('-dataset_name', default='christianity')
-parser.add_argument('-epoch', default=50)
+parser.add_argument('-epoch', default=100)
 parser.add_argument('-batch_size', default=64)
 parser.add_argument('-emb_dim', default=64)
 parser.add_argument('-train_rate', default=0.8)
@@ -27,7 +27,7 @@ parser.add_argument('-step_split', default=8)  # 级联超图的个数
 parser.add_argument('-lr', default=0.001)  # 学习率
 parser.add_argument('-lr_rl', default=0.00001)
 parser.add_argument('-early_stop_step', default=10)
-parser.add_argument('-sl_epochs', default=45)
+parser.add_argument('-sl_epochs', default=70)
 parser.add_argument('-rollout_steps', default=3)
 
 opt = parser.parse_args()
@@ -38,13 +38,13 @@ class ReplayBuffer:
     def __init__(self, capacity=5000):
         self.buffer = deque(maxlen=capacity)
 
-    def push(self, state_micro, action, reward, next_state_micro, current_seq, done):
+    def push(self, state_micro, action, reward, next_state_micro, current_seq, done, behavior_logp):
         # 存 CPU Tensor 以节省显存
-        self.buffer.append((state_micro, action, reward, next_state_micro, current_seq, done))
+        self.buffer.append((state_micro, action, reward, next_state_micro, current_seq, done, behavior_logp))
 
     def sample(self, batch_size):
         batch = random.sample(self.buffer, batch_size)
-        state, action, reward, next_state, cur_seq, done = zip(*batch)
+        state, action, reward, next_state, cur_seq, done, behavior_logp = zip(*batch)
 
         # Pad cur_seq (因为 rollout 时长度不一)
         max_len = max([s.size(0) for s in cur_seq])
@@ -53,8 +53,9 @@ class ReplayBuffer:
             pad = torch.zeros(max_len - s.size(0), dtype=torch.long)
             padded_seqs.append(torch.cat([s, pad]))
 
-        return (torch.stack(state), torch.tensor(action), torch.tensor(reward),
-                torch.stack(next_state), torch.stack(padded_seqs), torch.tensor(done))
+        return (torch.stack(state), torch.tensor(action, dtype=torch.long), torch.tensor(reward, dtype=torch.float),
+                torch.stack(next_state), torch.stack(padded_seqs), torch.tensor(done, dtype=torch.float),
+                torch.tensor(behavior_logp, dtype=torch.float))
 
     def __len__(self):
         return len(self.buffer)
@@ -160,7 +161,9 @@ def train_rl_step(model, train_loader, hypergraph_list, relation_graph, optimize
         with torch.no_grad():
             for t in range(opt.rollout_steps):
                 logits, pred_macro, s_micro, _ = model.forward_step(hypergraph_list, relation_graph, curr_seq)
-                actions = Categorical(logits=logits).sample()
+                dist = Categorical(logits=logits)
+                actions = dist.sample()
+                behavior_logp = dist.log_prob(actions)
                 next_seq = torch.cat([curr_seq, actions.unsqueeze(1)], dim=1)
                 _, _, s_micro_next, _ = model.forward_step(hypergraph_list, relation_graph, next_seq)
 
@@ -171,16 +174,17 @@ def train_rl_step(model, train_loader, hypergraph_list, relation_graph, optimize
                                        pred_macro[i].item(), tgt_len[i].item(), is_terminal,
                                        action_emb = act_emb, gt_avg_emb = gt_avg_embs[i])
                     buffer.push(s_micro[i].cpu(), actions[i].cpu(), r,
-                                s_micro_next[i].cpu(), curr_seq[i].cpu(), is_terminal)
+                                s_micro_next[i].cpu(), curr_seq[i].cpu(), is_terminal, behavior_logp[i].cpu())
                 curr_seq = next_seq
 
         # 2. Update (Check Buffer Size)
         if len(buffer) < opt.batch_size: continue
 
-        b_s, b_a, b_r, b_s_next, b_cur_seq, b_d = buffer.sample(opt.batch_size)
+        b_s, b_a, b_r, b_s_next, b_cur_seq, b_d, b_logp = buffer.sample(opt.batch_size)
         b_s, b_a, b_r = b_s.to(device), b_a.to(device), b_r.to(device)
         b_s_next, b_cur_seq = b_s_next.to(device), b_cur_seq.to(device)
         b_d = b_d.float().to(device)
+        b_logp = b_logp.to(device)
 
         current_graph_emb = model.relationGNN(relation_graph)
 
@@ -188,7 +192,8 @@ def train_rl_step(model, train_loader, hypergraph_list, relation_graph, optimize
         with torch.no_grad():
             logits_next = model.actor_head(b_s_next)
             a_next = Categorical(logits=logits_next).sample()
-            target_q = model.get_q_value(b_s_next, a_next, current_graph_emb, b_cur_seq).squeeze()
+            target_q = model.critic_target(b_s_next, F.embedding(a_next, current_graph_emb),
+                            model.compute_explicit_features(b_cur_seq, a_next)).squeeze()
             target = b_r + gamma * target_q * (1 - b_d)
 
         current_q = model.get_q_value(b_s, b_a, current_graph_emb, b_cur_seq).squeeze()
@@ -197,21 +202,24 @@ def train_rl_step(model, train_loader, hypergraph_list, relation_graph, optimize
         # Actor Update
         logits_pi = model.actor_head(b_s)
         dist_pi = Categorical(logits=logits_pi)
-        action_pi = dist_pi.sample()
-        log_prob = dist_pi.log_prob(action_pi)
-        q_base = model.get_q_value(b_s, action_pi, current_graph_emb, b_cur_seq).squeeze().detach()
+        log_prob_curr = dist_pi.log_prob(b_a)
         entropy = dist_pi.entropy().mean()
-        loss_pi = -(log_prob * q_base).mean() - 0.05 * entropy
+        ratio = torch.exp(log_prob_curr - b_logp)
+        ratio_clipped = torch.clamp(ratio, max=1.0)
+        advantage = (target - current_q).detach() # Advantage: use TD-error (target - current_q) as advantage estimate
+        advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-6)
+        # Actor loss: weighted by clipped IS ratio and advantage
+        loss_pi = -(ratio_clipped * log_prob_curr * advantage).mean() - 0.01 * entropy
 
         loss = loss_q + loss_pi
         optimizer.zero_grad()
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
         optimizer.step()
 
+        model.soft_update_target() # Soft-update the critic_target so TD targets evolve smoothly
         total_q_loss += loss_q.item()
         total_pi_loss += loss_pi.item()
-    buffer.buffer.clear()
-
     return total_q_loss, total_pi_loss
 
 def MAE(y, y_predicted):
@@ -391,7 +399,7 @@ def main():
         max_seq_len=200,
         device=device
     ).to(device)
-    buffer = ReplayBuffer(capacity=200)
+    buffer = ReplayBuffer(capacity=5000)
 
 
     micro_loss_func = nn.CrossEntropyLoss(size_average=False, ignore_index=Constants.PAD)
