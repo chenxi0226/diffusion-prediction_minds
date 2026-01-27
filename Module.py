@@ -42,6 +42,7 @@ class StructureAwareQCritic(nn.Module):
         x = torch.cat([state_emb, action_emb, explicit_feats], dim=-1)
         return self.net(x)
 
+
 class RL_MINDS_StructureAware(nn.Module):
     def __init__(self, user_size, embed_dim, step_split=8, max_seq_len=200, device=torch.device('cuda')):
         super(RL_MINDS_StructureAware, self).__init__()
@@ -49,33 +50,24 @@ class RL_MINDS_StructureAware(nn.Module):
         self.emb_dim = embed_dim
         self.device = device
 
-        # --- Encoders ---
+        # --- Encoders (核心表征层) ---
         self.dycasHGNN = DynamicCasHGNN(user_size, embed_dim, step_split)
         self.relationGNN = RelationGNN(user_size, embed_dim)
         self.relationLSTM = RelationLSTM(embed_dim)
         self.cascadeLSTM = CascadeLSTM(embed_dim)
         self.sharedLSTM = SharedLSTM(max_seq_len, embed_dim)
 
-        # --- Embeddings & Projections ---
-        self.user_embedding = nn.Embedding(user_size, embed_dim)
         self.W_micro = nn.Linear(embed_dim, embed_dim)
         self.W_macro = nn.Linear(embed_dim, embed_dim)
 
-        # --- Heads ---
+        # --- Policy Head (微观预测头) ---
         self.actor_head = nn.Sequential(
             nn.Linear(embed_dim, embed_dim),
             nn.Tanh(),
             nn.Linear(embed_dim, user_size)
         )
 
-        # Critic 输入维度：s_micro(D) + pred_macro(1) = D+1
-        self.critic = StructureAwareQCritic(state_dim=embed_dim + 1, action_dim=embed_dim)
-        from copy import deepcopy
-        self.critic_target = deepcopy(self.critic)
-        for p in self.critic_target.parameters():
-            p.requires_grad = False
-        self.tau = 0.001
-
+        # --- Macro Head (宏观规模头) ---
         self.macro_head = nn.Sequential(
             nn.Linear(embed_dim, embed_dim // 2),
             nn.ReLU(),
@@ -83,217 +75,76 @@ class RL_MINDS_StructureAware(nn.Module):
         )
 
         self.adj_matrix = None
+        # ✅ 已修正：调用正确的初始化方法
         self.init_weights()
 
     def init_weights(self):
         init.xavier_normal_(self.W_micro.weight)
         init.xavier_normal_(self.W_macro.weight)
-        init.xavier_normal_(self.user_embedding.weight)
-
-    def soft_update_target(self):
-        for parm, target_parm in zip(self.critic.parameters(), self.critic_target.parameters()):
-            target_parm.data.copy_(parm.data * self.tau + (1.0 - self.tau) * target_parm.data)
+        for m in self.actor_head:
+            if isinstance(m, nn.Linear): init.xavier_normal_(m.weight)
+        for m in self.macro_head:
+            if isinstance(m, nn.Linear): init.xavier_normal_(m.weight)
 
     def set_adjacency_matrix(self, relation_graph):
         if self.adj_matrix is not None: return
         try:
-            # 1. 获取 raw 数据
-            # 报错显示 relation_graph.e[0] 是 [E, 2]，说明它包含了完整的边信息
-            raw_data = relation_graph.e
-
-            src, dst = None, None
-
-            # 情况 A: 如果是元组 (Edges, Weights)
-            if isinstance(raw_data, tuple):
-                # 通常第一个元素是边索引
-                edges = raw_data[0]
-            else:
-                edges = raw_data
-
-            # 2. 统一转为 Tensor 并移动到设备
-            if not isinstance(edges, torch.Tensor):
-                edges = torch.tensor(edges, dtype=torch.long)
-            edges = edges.to(self.device)
-
-            # 3. 根据形状解析 src, dst
-            # 如果形状是 [E, 2] -> 每一行是 (u, v)
-            if edges.dim() == 2 and edges.shape[1] == 2:
-                src = edges[:, 0]
-                dst = edges[:, 1]
-            # 如果形状是 [2, E] -> 第一行是 u, 第二行是 v
-            elif edges.dim() == 2 and edges.shape[0] == 2:
-                src = edges[0]
-                dst = edges[1]
-            # 如果原本就是 tuple(src, dst) 且被我们误判了，再尝试解包
-            elif isinstance(raw_data, tuple) and len(raw_data) == 2 and edges.dim() == 1:
-                src = raw_data[0].to(self.device).long()
-                dst = raw_data[1].to(self.device).long()
-            else:
-                raise ValueError(f"Unexpected edge shape: {edges.shape}")
-
-            # 4. 构建稀疏矩阵
-            # 确保 src, dst 都是 1D Tensor
-            src = src.contiguous().view(-1)
-            dst = dst.contiguous().view(-1)
-
+            edges = relation_graph.e[0] if isinstance(relation_graph.e, tuple) else relation_graph.e
+            if not isinstance(edges, torch.Tensor): edges = torch.tensor(edges, dtype=torch.long)
+            src, dst = edges[:, 0], edges[:, 1]
             indices = torch.stack([src, dst], dim=0)
-            values = torch.ones(src.size(0)).to(self.device)
-            coo_adj = torch.sparse_coo_tensor(
-                indices, values, (self.user_size, self.user_size)
-            ).to(self.device)
-            self.adj_matrix = torch.sparse_coo_tensor(
-                indices, values, (self.user_size, self.user_size)
-            ).to(self.device)
-
-            # print(f"✅ Adjacency Matrix built. Edges: {src.size(0)}")
-
-        except Exception as e:
-            print(f"⚠️ Warning: Failed to build adjacency matrix: {e}")
-            # Fallback
-            self.adj_matrix = torch.sparse_coo_tensor(
-                torch.empty(2, 0).long().to(self.device),
-                torch.empty(0).to(self.device),
-                (self.user_size, self.user_size)
-            )
+            values = torch.ones(src.size(0))
+            self.adj_matrix = torch.sparse_coo_tensor(indices, values, (self.user_size, self.user_size)).to(self.device)
+        except Exception:
+            self.adj_matrix = None
 
     def lookup_embedding(self, examples, embeddings):
-        # 限制 index 范围防止越界
         examples = torch.clamp(examples, 0, embeddings.size(0) - 1)
         return F.embedding(examples, embeddings)
 
     def get_shared_state(self, graph_list, relation_graph, examples):
-        # 1. 全局图特征 (Batch无关)
-        user_cas_embedding = self.dycasHGNN(graph_list, self.device)  # [User, D]
-        user_social_embedding = self.relationGNN(relation_graph)  # [User, D]
-
-        # 2. Batch 序列特征
-        sender_social_embedding = self.relationLSTM(examples, user_social_embedding)
-
-        # lookup 将全局特征映射到当前 Batch
+        user_cas_embedding = self.dycasHGNN(graph_list, self.device)
+        user_social_embedding = self.relationGNN(relation_graph)
         sender_cas_embedding_share = self.lookup_embedding(examples, user_cas_embedding)
         sender_social_embedding_share = self.lookup_embedding(examples, user_social_embedding)
-
-        # 3. 融合
         shared_embedding, _ = self.sharedLSTM(sender_cas_embedding_share, sender_social_embedding_share)
-
         return shared_embedding, user_social_embedding
 
-    def compute_explicit_features(self, current_seq, action_candidates):
-        batch_size = current_seq.size(0)
-
-        # 1. Connectivity (稀疏矩阵乘法)
-        seq_multi_hot = torch.zeros(batch_size, self.user_size, device=self.device)
-        seq_multi_hot.scatter_(1, current_seq, 1.0)
-        seq_multi_hot[:, 0] = 0  # Mask PAD
-
-        if self.adj_matrix is not None:
-            # [User, User] @ [User, B] -> [User, B] -> [B, User]
-            all_connectivity = torch.sparse.mm(self.adj_matrix, seq_multi_hot.t()).t()
-            # Gather specific action
-            chosen_connectivity = all_connectivity.gather(1, action_candidates.unsqueeze(1))
-            seq_lens = (current_seq != 0).sum(dim=1, keepdim=True).float() + 1e-5
-            feature_connect = chosen_connectivity / seq_lens
-        else:
-            feature_connect = torch.zeros(batch_size, 1, device=self.device)
-
-        # 2. Is Infected
-        is_infected = (current_seq == action_candidates.unsqueeze(1)).any(dim=1).float().unsqueeze(1)
-
-        return torch.cat([feature_connect, is_infected], dim=-1)
-
-    def get_q_value(self, s_micro, action, graph_emb, current_seq):
-        """
-        Critic 闭环接口:
-        s_micro: State [B, D]
-        action: Action Index [B]
-        graph_emb: 全图 Embedding [User, D] (用于查找 Action 的向量表示)
-        """
-        # 1. Action Embedding Lookup
-        a_emb = F.embedding(action, graph_emb)
-
-        # 2. Explicit Features
-        explicit_feats = self.compute_explicit_features(current_seq, action)
-
-        # 3. Q-Net
-        return self.critic(s_micro, a_emb, explicit_feats)
-
-    def get_q_value_with_macro(self, s_micro, pred_macro, action, graph_emb, current_seq):
-        """
-        Augmented Q interface which includes the macro prediction scalar in the state.
-        - s_micro: [B, D]
-        - pred_macro: [B] or [B,1] scalar estimate of final cascade size
-        Returns: Q(s_aug, a) [B, 1]
-        """
-        if pred_macro.dim() == 1:
-            pred_macro = pred_macro.unsqueeze(1)
-        s_aug = torch.cat([s_micro, torch.log2(pred_macro + 1.0) / 7.0], dim=-1)  # [B, D+1]
-        a_emb = F.embedding(action, graph_emb)
-        explicit_feats = self.compute_explicit_features(current_seq, action)
-        return self.critic(s_aug, a_emb, explicit_feats)
-
-    def forward(self, graph_list, relation_graph, examples):
-        shared_emb, _ = self.get_shared_state(graph_list, relation_graph, examples)
-
-        s_micro = torch.tanh(self.W_micro(shared_emb))
-        s_macro = torch.tanh(self.W_macro(shared_emb))
-
-        actor_logits = self.actor_head(s_micro)
-
-        # Macro Pooling
-        batch_size = examples.size(0)
-        example_len = torch.count_nonzero(examples, 1)
-        s_macro_last = []
-        for i in range(batch_size):
-            idx = example_len[i] - 1
-            if idx < 0: idx = 0
-            s_macro_last.append(s_macro[i, idx, :])
-        s_macro_last = torch.stack(s_macro_last, dim=0)
-
-        pred_macro = self.macro_head(s_macro_last)
-
-        return actor_logits, pred_macro
-
     def get_topological_mask(self, current_seq):
+        """核心：将搜索空间锁定在社交邻居内"""
         batch_size = current_seq.size(0)
-        # 1. 构建当前感染者的 Multi-hot 向量 [B, User]
         infected_mask = torch.zeros(batch_size, self.user_size, device=self.device)
         infected_mask.scatter_(1, current_seq, 1.0)
-        infected_mask[:, 0] = 0  # 排除 PAD 位置
-
+        infected_mask[:, 0] = 0
         if self.adj_matrix is not None:
-            # 2. 修正后的稀疏矩阵乘法逻辑
-            # 注意：torch.sparse.mm 在 CUDA 上要求第一个参数为稀疏张量
-            # 我们计算 (Adj @ Infected.T).T 来获得 [B, User] 维度的邻居特征
-            # adj_matrix: [User, User], infected_mask.t(): [User, B]
+            # (Adj @ Infected.T).T -> 获取邻居
             neighbor_logits = torch.sparse.mm(self.adj_matrix, infected_mask.t()).t()
-
-            # 3. 构造掩码：(不是邻居 AND 不是已感染者) 的位置设为 -inf
             topo_mask = torch.where(neighbor_logits > 0, 0.0, -1e9)
-
-            # 4. 强制排除已感染者 (防止回环)
             topo_mask.scatter_(1, current_seq, -1e9)
             return topo_mask
-
         return torch.zeros(batch_size, self.user_size, device=self.device)
 
     def forward_step(self, graph_list, relation_graph, current_seq):
-        """RL Rollout 接口：增加拓扑约束"""
-        if self.adj_matrix is None:
-            self.set_adjacency_matrix(relation_graph)
-
+        if self.adj_matrix is None: self.set_adjacency_matrix(relation_graph)
         shared_emb, graph_emb = self.get_shared_state(graph_list, relation_graph, current_seq)
         s_t = shared_emb[:, -1, :]
-
         s_micro = torch.tanh(self.W_micro(s_t))
         s_macro = torch.tanh(self.W_macro(s_t))
-
         logits = self.actor_head(s_micro)
-
-        # --- 关键修改：应用拓扑过滤 ---
         topo_mask = self.get_topological_mask(current_seq)
-        logits = logits + topo_mask
         pred_size = self.macro_head(s_macro)
-        return logits, pred_size, s_micro, graph_emb
+        return logits + topo_mask, pred_size, s_micro, graph_emb
+
+    def forward(self, graph_list, relation_graph, examples):
+        shared_emb, _ = self.get_shared_state(graph_list, relation_graph, examples)
+        s_micro = torch.tanh(self.W_micro(shared_emb))
+        s_macro = torch.tanh(self.W_macro(shared_emb))
+        actor_logits = self.actor_head(s_micro)
+        batch_size = examples.size(0)
+        example_len = torch.count_nonzero(examples, 1)
+        s_macro_last = torch.stack([s_macro[i, max(0, example_len[i]-1), :] for i in range(batch_size)], dim=0)
+        pred_macro = self.macro_head(s_macro_last)
+        return actor_logits, pred_macro
 
 class RelationGNN(nn.Module):
     '''社交图GNN'''

@@ -14,7 +14,7 @@ from DataSet import *
 import sys
 
 parser = argparse.ArgumentParser()
-parser.add_argument('-dataset_name', default='android')
+parser.add_argument('-dataset_name', default='douban')
 parser.add_argument('-epoch', default=100)
 parser.add_argument('-batch_size', default=64)
 parser.add_argument('-emb_dim', default=64)
@@ -25,10 +25,10 @@ parser.add_argument('-gamma_loss', default=0.05)  # 正交性约束平衡参数�
 parser.add_argument('-max_seq_length', default=200)
 parser.add_argument('-step_split', default=8)  # 级联超图的个数
 parser.add_argument('-lr', default=0.001)  # 学习率
-parser.add_argument('-lr_rl', default=0.000005)
+parser.add_argument('-lr_rl', default=0.00005)
 parser.add_argument('-early_stop_step', default=10)
-parser.add_argument('-sl_epochs', default=1)
-parser.add_argument('-rollout_steps', default=5)
+parser.add_argument('-sl_epochs', default=60)
+parser.add_argument('-rollout_steps', default=10)
 parser.add_argument('-eta', default=0.1)
 parser.add_argument('-alpha_macro', default=0.5)
 parser.add_argument('-gamma', default=0.99)
@@ -148,172 +148,109 @@ def train_sl_step(model, batch, hypergraph_list, relation_graph, optimizer, devi
     return loss.item(), n_correct, n_total
 
 
-def train_rl_step(model, train_loader, hypergraph_list, relation_graph, optimizer, buffer, device, current_eta):
-    """RL 整个 Epoch 的训练 (包含 Rollout 和 Update)"""
-    # ⚠️ 注意：RL 是一次性跑完整个 Loader 做 Rollout，然后 Update
-    # 为了适配外层循环结构，我们在这里把逻辑写完整，外层直接调用
+# --- run.py 修改 ---
+def compute_reward_minimal(action, gt_set, pred_macro_next, gt_size, is_terminal):
+    if action not in gt_set:
+        return -0.1
 
+    gt = max(gt_size, 1.0)
+    msle = pow(math.log2(max(float(pred_macro_next), 1.0)) - math.log2(gt), 2)
+
+    # 核心修改：提高基础分到 5.0，并减弱 msle 的压制程度 (使用 0.2 缩放)
+    align_factor = math.exp(-msle * 0.2)
+    reward = 5.0 * align_factor
+
+    if is_terminal: reward -= 0.5 * msle  # 加大对最终规模不准的惩罚
+    return reward
+
+
+def train_rl_step_minmal(model, train_loader, hypergraph_list, relation_graph, optimizer, buffer, device, current_eta):
     model.train()
-    total_q_loss = 0
-    total_pi_loss = 0
-    total_phi = 0.0
-    total_terminal_msle = 0.0
-    update_count = 0
-    step_count = 0
-    terminal_count = 0
+    total_pi_loss, update_count = 0, 0
+    total_phi, total_terminal_msle, step_count, terminal_count = 0.0, 0.0, 0, 0
+    entropy_weight = 0.02
 
-    with torch.no_grad():
-        full_graph_emb = model.relationGNN(relation_graph).detach()
-
-    # 1. Rollout
     for batch in train_loader:
         tgt, _, _, tgt_len = (item.to(device) for item in batch)
         bs = tgt.size(0)
-
-        start_len = random.randint(2, min(5, tgt.size(1) - 1)) # sample length
+        start_len = random.randint(2, 5)
         init_seq = tgt[:, :start_len]
+        gt_sets = [set([u for u in t.cpu().numpy() if u != 0]) for t in tgt]
 
-        gt_avg_embs = []
-        gt_sets = []
-        for i in range(bs):
-            gt_users = tgt[i].cpu().numpy().tolist()
-            gt_users = [u for u in gt_users if u != 0]
-            gt_sets.append(set(gt_users))
-
-            if len(gt_users) > 0:
-                user_idxs = torch.tensor(gt_users).to(device)
-                avg_emb = full_graph_emb[user_idxs].mean(dim=0)
-            else:
-                avg_emb = torch.zeros(opt.emb_dim).to(device)
-            gt_avg_embs.append(avg_emb)
-
+        # 1. Greedy Rollout (Baseline)
         with torch.no_grad():
-            greedy_seq = init_seq.clone()
-            baseline_rewards_total = torch.zeros(bs, device=device)
+            g_seq = init_seq.clone()
+            g_reward = torch.zeros(bs, device=device)
             for t in range(opt.rollout_steps):
-                logits_g, pred_g_curr, _, _ = model.forward_step(hypergraph_list, relation_graph, greedy_seq)
-                actions_g = logits_g.argmax(dim=-1)
-                next_g_seq = torch.cat([greedy_seq, actions_g.unsqueeze(1)], dim=1)
-                _, pred_g_next, _, _ = model.forward_step(hypergraph_list, relation_graph, next_g_seq)
+                logits, pred, _, _ = model.forward_step(hypergraph_list, relation_graph, g_seq)
+                actions = logits.argmax(dim=-1)
+                next_seq = torch.cat([g_seq, actions.unsqueeze(1)], dim=1)
+                _, pred_next, _, _ = model.forward_step(hypergraph_list, relation_graph, next_seq)
                 for i in range(bs):
-                    rg = compute_reward_macro_guided(
-                        actions_g[i].item(), gt_sets[i],
-                        pred_g_curr[i].item(), pred_g_next[i].item(),
-                        tgt_len[i].item(), (t == opt.rollout_steps - 1),
-                        action_emb=full_graph_emb[actions_g[i]], gt_avg_emb=gt_avg_embs[i],
-                        current_eta=current_eta
-                    )
-                    baseline_rewards_total[i] += rg
-                greedy_seq = next_g_seq
-            baseline_per_step = baseline_rewards_total / opt.rollout_steps
+                    g_reward[i] += compute_reward_minimal(actions[i].item(), gt_sets[i], pred_next[i].item(),
+                                                          tgt_len[i].item(), t == opt.rollout_steps - 1)
+                g_seq = next_seq
+            baseline = g_reward / opt.rollout_steps
 
-        curr_seq = init_seq.clone()
+        # 2. Sampled Path (探索)
+        s_seq = init_seq.clone()
+        log_probs = []
+        entropies = []
+        s_reward = torch.zeros(bs, device=device)
         for t in range(opt.rollout_steps):
+            logits, pred_curr, _, _ = model.forward_step(hypergraph_list, relation_graph, s_seq)
+            mask = get_previous_user_mask(s_seq, model.user_size).to(device)
+            dist = Categorical(logits=logits + mask[:, -1, :])
+            actions = dist.sample()
+            log_probs.append(dist.log_prob(actions))
+            entropies.append(dist.entropy())
+
+            next_seq = torch.cat([s_seq, actions.unsqueeze(1)], dim=1)
             with torch.no_grad():
-                logits, pred_macro, s_micro, _ = model.forward_step(hypergraph_list, relation_graph, curr_seq)
-                mask = get_previous_user_mask(curr_seq, model.user_size).to(device)
-                masked_logits = logits + mask[:, -1, :]
-                dist = Categorical(logits=masked_logits)
-                actions = dist.sample()
-                behavior_logp = dist.log_prob(actions)
+                _, pred_next, _, _ = model.forward_step(hypergraph_list, relation_graph, next_seq)
 
-                next_seq = torch.cat([curr_seq, actions.unsqueeze(1)], dim=1)
-                _, pred_macro_next, s_micro_next, _ = model.forward_step(hypergraph_list, relation_graph, next_seq)
+            for i in range(bs):
+                r = compute_reward_minimal(actions[i].item(), gt_sets[i], pred_next[i].item(), tgt_len[i].item(),
+                                           t == opt.rollout_steps - 1)
+                s_reward[i] += r
 
-                for i in range(bs):
-                    is_terminal = (t == opt.rollout_steps - 1)
-                    act_idx = actions[i].item()
-                    act_emb = full_graph_emb[act_idx]
-                    r_raw = compute_reward_macro_guided(
-                        action = act_idx, gt_set = gt_sets[i],
-                        pred_macro_curr=pred_macro[i].item(), pred_macro_next=pred_macro_next[i].item(),
-                        gt_size=tgt_len[i].item(), is_terminal=is_terminal, action_emb=act_emb,
-                        gt_avg_emb=gt_avg_embs[i],
-                        current_eta = current_eta
-                    )
-                    r_scst = (r_raw - baseline_per_step[i].item()) * 10.0
-
-                # calculate watching index
+                # 统计宏观监控指标
                 gt_i = max(float(tgt_len[i].item()), 1.0)
-                phi_curr = - abs(math.log1p(float(pred_macro[i].item())) - math.log1p(gt_i)) / math.log1p(gt_i)
-                total_phi += phi_curr
+                total_phi += - abs(math.log1p(float(pred_curr[i].item())) - math.log1p(gt_i)) / math.log1p(gt_i)
                 step_count += 1
-
-                if is_terminal:
-                    msle_like = abs(math.log2(max(float(pred_macro_next[i].item()), 1.0)) - math.log2(gt_i))
-                    total_terminal_msle += msle_like
+                if t == opt.rollout_steps - 1:
+                    total_terminal_msle += abs(math.log2(max(float(pred_next[i].item()), 1.0)) - math.log2(gt_i))
                     terminal_count += 1
+            s_seq = next_seq
 
-                buffer.push(
-                    s_micro[i].cpu(), actions[i].cpu(), r_scst,
-                    s_micro_next[i].cpu(), curr_seq[i].cpu(), is_terminal,
-                    behavior_logp[i].cpu(),
-                    pred_macro[i].cpu(), pred_macro_next[i].cpu()
-                )
-            curr_seq = next_seq
+        # 3. SCST Advantage & Update
+        # Advantage = (采样路径平均奖励 - 贪婪路径平均奖励) * 放大信号
+        advantage = (s_reward / opt.rollout_steps - baseline).detach()
 
-        # 2. Update (Check Buffer Size)
-        if len(buffer) < opt.batch_size: continue
+        # 诊断打印：如果这个值一直是 0，说明模型还在冷启动，需要增加 SL Epochs
+        if random.random() < 0.01:
+            print(f"      [Debug] Advantage Mean: {advantage.mean().item():.4f}, Std: {advantage.std().item():.4f}")
 
-        (b_s, b_a, b_r, b_s_next, b_cur_seq, b_d,
-            b_logp, b_pred_macro, b_pred_macro_next) = buffer.sample(opt.batch_size)
-        b_s, b_a, b_r = b_s.to(device), b_a.to(device), b_r.to(device)
-        b_s_next, b_cur_seq = b_s_next.to(device), b_cur_seq.to(device)
-        b_d = b_d.float().to(device)
-        b_logp = b_logp.to(device)
-        b_pred_macro = b_pred_macro.to(device)
-        b_pred_macro_next = b_pred_macro_next.to(device)
-
-        current_graph_emb = model.relationGNN(relation_graph)
-
-        # Critic Update
-        with torch.no_grad():
-            logits_next = model.actor_head(b_s_next) # actor (on next state)
-            a_next = Categorical(logits=logits_next).sample()
-            norm_macro_next = torch.log2(b_pred_macro_next.unsqueeze(-1) + 1.0) / 7.0
-            s_aug_next = torch.cat([b_s_next, norm_macro_next], dim=-1)
-            target_q = model.critic_target(
-                s_aug_next,
-                F.embedding(a_next, current_graph_emb),
-                model.compute_explicit_features(b_cur_seq, a_next)
-            ).squeeze()
-            target = b_r + opt.gamma * target_q * (1 - b_d)
-
-        current_q = model.get_q_value_with_macro(
-            b_s, b_pred_macro, b_a, current_graph_emb, b_cur_seq).squeeze()
-        loss_q = F.mse_loss(current_q, target)
-
-        # Actor Update
-        logits_pi = model.actor_head(b_s)
-        dist_pi = Categorical(logits=logits_pi)
-        log_prob_curr = dist_pi.log_prob(b_a)
-        entropy = dist_pi.entropy().mean()
-        ratio = torch.exp(log_prob_curr - b_logp)
-        ratio_clipped = torch.clamp(ratio, 0.8, 1.2)
-        advantage = (target - current_q).detach() # Advantage: use TD-error (target - current_q) as advantage estimate
-        if advantage.std() > 1e-6:
+        if advantage.std() > 1e-8:
             advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
-        else:
-            advantage = advantage - advantage.mean()
-        # Actor loss: weighted by clipped IS ratio and advantage
-        loss_pi = -(ratio_clipped * log_prob_curr * advantage).mean() - 0.02 * entropy
 
-        loss = loss_q + loss_pi
+        # 纯策略梯度 Loss (叠加 0.05 的熵奖励强制探索)
+        pi_loss_per_batch = -(torch.stack(log_probs).sum(dim=0) * advantage)
+        entropy_loss_per_batch = - (torch.stack(entropies).sum(dim=0))  # 负熵用于最大化
+
+        pi_loss = (pi_loss_per_batch + entropy_weight * entropy_loss_per_batch).mean()
+
         optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+        pi_loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
         optimizer.step()
 
-        model.soft_update_target() # Soft-update the critic_target so TD targets evolve smoothly
+        total_pi_loss += pi_loss.item()
         update_count += 1
-        total_q_loss += loss_q.item()
-        total_pi_loss += loss_pi.item()
 
-    avg_q = total_q_loss / (update_count + 1e-9)
-    avg_pi = total_pi_loss / (update_count + 1e-9)
     avg_phi = total_phi / (step_count + 1e-9)
     avg_msle = total_terminal_msle / (terminal_count + 1e-9)
-    return avg_q, avg_pi, avg_phi, avg_msle
+    return 0.0, total_pi_loss / update_count, avg_phi, avg_msle
 
 def MAE(y, y_predicted):
     y_predicted = y_predicted.squeeze()
@@ -429,7 +366,7 @@ def train_epoch(model, train_loader, relation_graph, hypergraph_list, micro_loss
         current_eta = opt.eta
         if current_epoch_idx < int(opt.sl_epochs) + 5:
             current_eta = 0.0
-        q_loss, pi_loss, phi_mean, terminal_msle = train_rl_step(model, train_loader, hypergraph_list, relation_graph, optimizer, buffer, device, current_eta)
+        q_loss, pi_loss, phi_mean, terminal_msle = train_rl_step_minmal(model, train_loader, hypergraph_list, relation_graph, optimizer, buffer, device, current_eta)
 
         # RL 阶段 loss 含义变化，返回 total loss 供打印
         total_rl_loss = q_loss + pi_loss
