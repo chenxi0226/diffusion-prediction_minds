@@ -42,7 +42,6 @@ class StructureAwareQCritic(nn.Module):
         x = torch.cat([state_emb, action_emb, explicit_feats], dim=-1)
         return self.net(x)
 
-
 class RL_MINDS_StructureAware(nn.Module):
     def __init__(self, user_size, embed_dim, step_split=8, max_seq_len=200, device=torch.device('cuda')):
         super(RL_MINDS_StructureAware, self).__init__()
@@ -139,7 +138,9 @@ class RL_MINDS_StructureAware(nn.Module):
 
             indices = torch.stack([src, dst], dim=0)
             values = torch.ones(src.size(0)).to(self.device)
-
+            coo_adj = torch.sparse_coo_tensor(
+                indices, values, (self.user_size, self.user_size)
+            ).to(self.device)
             self.adj_matrix = torch.sparse_coo_tensor(
                 indices, values, (self.user_size, self.user_size)
             ).to(self.device)
@@ -200,22 +201,6 @@ class RL_MINDS_StructureAware(nn.Module):
 
         return torch.cat([feature_connect, is_infected], dim=-1)
 
-    def forward_step(self, graph_list, relation_graph, current_seq):
-        """RL Rollout 接口"""
-        if self.adj_matrix is None:
-            self.set_adjacency_matrix(relation_graph)
-
-        shared_emb, graph_emb = self.get_shared_state(graph_list, relation_graph, current_seq)
-        s_t = shared_emb[:, -1, :]  # Last Step
-
-        s_micro = torch.tanh(self.W_micro(s_t))
-        s_macro = torch.tanh(self.W_macro(s_t))
-
-        logits = self.actor_head(s_micro)
-        pred_size = self.macro_head(s_macro)
-
-        return logits, pred_size, s_micro, graph_emb
-
     def get_q_value(self, s_micro, action, graph_emb, current_seq):
         """
         Critic 闭环接口:
@@ -267,6 +252,48 @@ class RL_MINDS_StructureAware(nn.Module):
         pred_macro = self.macro_head(s_macro_last)
 
         return actor_logits, pred_macro
+
+    def get_topological_mask(self, current_seq):
+        batch_size = current_seq.size(0)
+        # 1. 构建当前感染者的 Multi-hot 向量 [B, User]
+        infected_mask = torch.zeros(batch_size, self.user_size, device=self.device)
+        infected_mask.scatter_(1, current_seq, 1.0)
+        infected_mask[:, 0] = 0  # 排除 PAD 位置
+
+        if self.adj_matrix is not None:
+            # 2. 修正后的稀疏矩阵乘法逻辑
+            # 注意：torch.sparse.mm 在 CUDA 上要求第一个参数为稀疏张量
+            # 我们计算 (Adj @ Infected.T).T 来获得 [B, User] 维度的邻居特征
+            # adj_matrix: [User, User], infected_mask.t(): [User, B]
+            neighbor_logits = torch.sparse.mm(self.adj_matrix, infected_mask.t()).t()
+
+            # 3. 构造掩码：(不是邻居 AND 不是已感染者) 的位置设为 -inf
+            topo_mask = torch.where(neighbor_logits > 0, 0.0, -1e9)
+
+            # 4. 强制排除已感染者 (防止回环)
+            topo_mask.scatter_(1, current_seq, -1e9)
+            return topo_mask
+
+        return torch.zeros(batch_size, self.user_size, device=self.device)
+
+    def forward_step(self, graph_list, relation_graph, current_seq):
+        """RL Rollout 接口：增加拓扑约束"""
+        if self.adj_matrix is None:
+            self.set_adjacency_matrix(relation_graph)
+
+        shared_emb, graph_emb = self.get_shared_state(graph_list, relation_graph, current_seq)
+        s_t = shared_emb[:, -1, :]
+
+        s_micro = torch.tanh(self.W_micro(s_t))
+        s_macro = torch.tanh(self.W_macro(s_t))
+
+        logits = self.actor_head(s_micro)
+
+        # --- 关键修改：应用拓扑过滤 ---
+        topo_mask = self.get_topological_mask(current_seq)
+        logits = logits + topo_mask
+        pred_size = self.macro_head(s_macro)
+        return logits, pred_size, s_micro, graph_emb
 
 class RelationGNN(nn.Module):
     '''社交图GNN'''

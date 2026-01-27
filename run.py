@@ -27,7 +27,7 @@ parser.add_argument('-step_split', default=8)  # 级联超图的个数
 parser.add_argument('-lr', default=0.001)  # 学习率
 parser.add_argument('-lr_rl', default=0.000005)
 parser.add_argument('-early_stop_step', default=10)
-parser.add_argument('-sl_epochs', default=70)
+parser.add_argument('-sl_epochs', default=1)
 parser.add_argument('-rollout_steps', default=5)
 parser.add_argument('-eta', default=0.1)
 parser.add_argument('-alpha_macro', default=0.5)
@@ -69,46 +69,49 @@ class ReplayBuffer:
         return len(self.buffer)
 
 
-# --- 辅助函数 ---
-def compute_reward_with_shaping(action, gt_set, pred_macro_curr, pred_macro_next, gt_size, is_terminal,
-                   action_emb=None, gt_avg_emb=None, current_eta = opt.eta):
+def compute_reward_macro_guided(action, gt_set, pred_macro_curr, pred_macro_next, gt_size, is_terminal,
+                                action_emb=None, gt_avg_emb=None, current_eta=opt.eta):
     """
-    New reward with three parts:
-      1) micro immediate reward
-      2) potential-based shaping: eta * (gamma * Phi(next) - Phi(curr))
-      3) terminal macro reward (aligned with MSLE / relative error)
-    Phi(s) is chosen as negative absolute log-difference to gt_size (higher is better).
+    重构后的奖励函数：实现宏观引导微观的协同优化。
+
+    逻辑：
+    1. 计算基础微观奖励 (Base Micro Reward)，包含命中奖励和 Embedding 软对齐奖励。
+    2. 计算宏观对齐因子 (Align Factor)，基于当前预测规模与真实规模的 MSLE 距离。
+    3. 耦合：Reward = Base_Micro_Reward * Align_Factor。
+    4. 附加基于势能的奖励塑造 (Reward Shaping) 和终端惩罚。
     """
-    reward = 0.0
-    shaping_discount = 1.0
+    is_hit = action in gt_set
 
-    if action in gt_set:
-        reward += 1.0
-    else:
-        # soft alignment 解决Reward稀疏问题
-        if action_emb is not None and gt_avg_emb is not None:
-            sim = F.cosine_similarity(action_emb.unsqueeze(0), gt_avg_emb.unsqueeze(0)).item()
-            if sim > 0.5:
-                reward += 0.1 * sim
-            else:
-                reward -= 0.05
-        else:
-            reward -= 0.1
-            shaping_discount = 0.1
+    # --- Step 1: 计算基础微观奖励 (Base Micro Reward) ---
+    base_reward = 5.0 if is_hit else -0.5
+    msle_dist = abs(math.log2(max(float(pred_macro_next), 1.0)) - math.log2(max(gt_size, 1.0)))
+    align_factor = math.exp(-msle_dist * 0.5)
 
+    shaping_discount = 0.1
+    reward = base_reward * align_factor
+
+    # --- Step 4: 势能奖励塑造 (Potential-based Shaping) ---
     gt = max(gt_size, 1.0)
+
+    # 定义势能函数 $\Phi(s) = - (\ln(1+p) - \ln(1+gt))^2$
     def Phi(pred):
         p = float(pred)
         return - pow(math.log1p(p) - math.log1p(gt), 2)
+
     phi_curr = Phi(pred_macro_curr)
     phi_next = Phi(pred_macro_next)
+
+    # 引导奖励：鼓励 pred_macro 向真实规模靠拢
     shaping = current_eta * 0.1 * (opt.gamma * phi_next - phi_curr)
     shaping = torch.clamp(torch.tensor(shaping), -0.1, 0.1).item()
+
     reward += shaping * shaping_discount
 
+    # --- Step 5: 终端宏观惩罚 ---
     if is_terminal:
         pred = max(pred_macro_next, 1.0)
         msle_val = pow(math.log2(pred) - math.log2(max(gt_size, 1.0)), 2)
+        # 终端宏观惩罚，加强对最终规模的约束
         reward -= opt.alpha_macro * 0.05 * msle_val
 
     return reward
@@ -168,7 +171,8 @@ def train_rl_step(model, train_loader, hypergraph_list, relation_graph, optimize
         bs = tgt.size(0)
 
         start_len = random.randint(2, min(5, tgt.size(1) - 1)) # sample length
-        curr_seq = tgt[:, :start_len]
+        init_seq = tgt[:, :start_len]
+
         gt_avg_embs = []
         gt_sets = []
         for i in range(bs):
@@ -184,7 +188,28 @@ def train_rl_step(model, train_loader, hypergraph_list, relation_graph, optimize
             gt_avg_embs.append(avg_emb)
 
         with torch.no_grad():
+            greedy_seq = init_seq.clone()
+            baseline_rewards_total = torch.zeros(bs, device=device)
             for t in range(opt.rollout_steps):
+                logits_g, pred_g_curr, _, _ = model.forward_step(hypergraph_list, relation_graph, greedy_seq)
+                actions_g = logits_g.argmax(dim=-1)
+                next_g_seq = torch.cat([greedy_seq, actions_g.unsqueeze(1)], dim=1)
+                _, pred_g_next, _, _ = model.forward_step(hypergraph_list, relation_graph, next_g_seq)
+                for i in range(bs):
+                    rg = compute_reward_macro_guided(
+                        actions_g[i].item(), gt_sets[i],
+                        pred_g_curr[i].item(), pred_g_next[i].item(),
+                        tgt_len[i].item(), (t == opt.rollout_steps - 1),
+                        action_emb=full_graph_emb[actions_g[i]], gt_avg_emb=gt_avg_embs[i],
+                        current_eta=current_eta
+                    )
+                    baseline_rewards_total[i] += rg
+                greedy_seq = next_g_seq
+            baseline_per_step = baseline_rewards_total / opt.rollout_steps
+
+        curr_seq = init_seq.clone()
+        for t in range(opt.rollout_steps):
+            with torch.no_grad():
                 logits, pred_macro, s_micro, _ = model.forward_step(hypergraph_list, relation_graph, curr_seq)
                 mask = get_previous_user_mask(curr_seq, model.user_size).to(device)
                 masked_logits = logits + mask[:, -1, :]
@@ -199,31 +224,33 @@ def train_rl_step(model, train_loader, hypergraph_list, relation_graph, optimize
                     is_terminal = (t == opt.rollout_steps - 1)
                     act_idx = actions[i].item()
                     act_emb = full_graph_emb[act_idx]
-                    r = compute_reward_with_shaping(
+                    r_raw = compute_reward_macro_guided(
                         action = act_idx, gt_set = gt_sets[i],
                         pred_macro_curr=pred_macro[i].item(), pred_macro_next=pred_macro_next[i].item(),
                         gt_size=tgt_len[i].item(), is_terminal=is_terminal, action_emb=act_emb,
                         gt_avg_emb=gt_avg_embs[i],
                         current_eta = current_eta
                     )
+                    r_scst = (r_raw - baseline_per_step[i].item()) * 10.0
 
-                    # calculate watching index
-                    gt_i = max(float(tgt_len[i].item()), 1.0)
-                    phi_curr = - abs(math.log1p(float(pred_macro[i].item())) - math.log1p(gt_i)) / math.log1p(gt_i)
-                    total_phi += phi_curr
-                    step_count += 1
+                # calculate watching index
+                gt_i = max(float(tgt_len[i].item()), 1.0)
+                phi_curr = - abs(math.log1p(float(pred_macro[i].item())) - math.log1p(gt_i)) / math.log1p(gt_i)
+                total_phi += phi_curr
+                step_count += 1
 
-                    if is_terminal:
-                        msle_like = abs(math.log2(max(float(pred_macro_next[i].item()), 1.0)) - math.log2(gt_i))
-                        total_terminal_msle += msle_like
-                        terminal_count += 1
+                if is_terminal:
+                    msle_like = abs(math.log2(max(float(pred_macro_next[i].item()), 1.0)) - math.log2(gt_i))
+                    total_terminal_msle += msle_like
+                    terminal_count += 1
 
-                    buffer.push(
-                        s_micro[i].cpu(), actions[i].cpu(), r,
-                        s_micro_next[i].cpu(), curr_seq[i].cpu(), is_terminal,
-                        behavior_logp[i].cpu(),
-                        pred_macro[i].cpu(), pred_macro_next[i].cpu()
-                    )
+                buffer.push(
+                    s_micro[i].cpu(), actions[i].cpu(), r_scst,
+                    s_micro_next[i].cpu(), curr_seq[i].cpu(), is_terminal,
+                    behavior_logp[i].cpu(),
+                    pred_macro[i].cpu(), pred_macro_next[i].cpu()
+                )
+            curr_seq = next_seq
 
         # 2. Update (Check Buffer Size)
         if len(buffer) < opt.batch_size: continue
@@ -264,9 +291,12 @@ def train_rl_step(model, train_loader, hypergraph_list, relation_graph, optimize
         ratio = torch.exp(log_prob_curr - b_logp)
         ratio_clipped = torch.clamp(ratio, 0.8, 1.2)
         advantage = (target - current_q).detach() # Advantage: use TD-error (target - current_q) as advantage estimate
-        advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-6)
+        if advantage.std() > 1e-6:
+            advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
+        else:
+            advantage = advantage - advantage.mean()
         # Actor loss: weighted by clipped IS ratio and advantage
-        loss_pi = -(ratio_clipped * log_prob_curr * advantage).mean() - 0.05 * entropy
+        loss_pi = -(ratio_clipped * log_prob_curr * advantage).mean() - 0.02 * entropy
 
         loss = loss_q + loss_pi
         optimizer.zero_grad()
