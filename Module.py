@@ -25,7 +25,7 @@ class StructureAwareQCritic(nn.Module):
             nn.Linear(self.input_dim, hidden_dim),
             nn.LeakyReLU(0.2),  # LeakyRLU 对稀疏信号更友好
             nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
+            nn.Tanh(),
             nn.Linear(hidden_dim, 1)  # Output Q-Value
         )
         self.init_weights()
@@ -69,13 +69,13 @@ class RL_MINDS_StructureAware(nn.Module):
             nn.Linear(embed_dim, user_size)
         )
 
-        # Critic 输入维度需匹配
-        self.critic = StructureAwareQCritic(state_dim=embed_dim, action_dim=embed_dim)
+        # Critic 输入维度：s_micro(D) + pred_macro(1) = D+1
+        self.critic = StructureAwareQCritic(state_dim=embed_dim + 1, action_dim=embed_dim)
         from copy import deepcopy
         self.critic_target = deepcopy(self.critic)
         for p in self.critic_target.parameters():
             p.requires_grad = False
-        self.tau = 0.0005
+        self.tau = 0.001
 
         self.macro_head = nn.Sequential(
             nn.Linear(embed_dim, embed_dim // 2),
@@ -231,6 +231,20 @@ class RL_MINDS_StructureAware(nn.Module):
 
         # 3. Q-Net
         return self.critic(s_micro, a_emb, explicit_feats)
+
+    def get_q_value_with_macro(self, s_micro, pred_macro, action, graph_emb, current_seq):
+        """
+        Augmented Q interface which includes the macro prediction scalar in the state.
+        - s_micro: [B, D]
+        - pred_macro: [B] or [B,1] scalar estimate of final cascade size
+        Returns: Q(s_aug, a) [B, 1]
+        """
+        if pred_macro.dim() == 1:
+            pred_macro = pred_macro.unsqueeze(1)
+        s_aug = torch.cat([s_micro, torch.log2(pred_macro + 1.0) / 7.0], dim=-1)  # [B, D+1]
+        a_emb = F.embedding(action, graph_emb)
+        explicit_feats = self.compute_explicit_features(current_seq, action)
+        return self.critic(s_aug, a_emb, explicit_feats)
 
     def forward(self, graph_list, relation_graph, examples):
         shared_emb, _ = self.get_shared_state(graph_list, relation_graph, examples)

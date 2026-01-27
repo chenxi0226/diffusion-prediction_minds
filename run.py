@@ -14,7 +14,7 @@ from DataSet import *
 import sys
 
 parser = argparse.ArgumentParser()
-parser.add_argument('-dataset_name', default='christianity')
+parser.add_argument('-dataset_name', default='android')
 parser.add_argument('-epoch', default=100)
 parser.add_argument('-batch_size', default=64)
 parser.add_argument('-emb_dim', default=64)
@@ -25,10 +25,13 @@ parser.add_argument('-gamma_loss', default=0.05)  # 正交性约束平衡参数�
 parser.add_argument('-max_seq_length', default=200)
 parser.add_argument('-step_split', default=8)  # 级联超图的个数
 parser.add_argument('-lr', default=0.001)  # 学习率
-parser.add_argument('-lr_rl', default=0.00001)
+parser.add_argument('-lr_rl', default=0.000005)
 parser.add_argument('-early_stop_step', default=10)
 parser.add_argument('-sl_epochs', default=70)
-parser.add_argument('-rollout_steps', default=3)
+parser.add_argument('-rollout_steps', default=5)
+parser.add_argument('-eta', default=0.1)
+parser.add_argument('-alpha_macro', default=0.5)
+parser.add_argument('-gamma', default=0.99)
 
 opt = parser.parse_args()
 
@@ -38,13 +41,16 @@ class ReplayBuffer:
     def __init__(self, capacity=5000):
         self.buffer = deque(maxlen=capacity)
 
-    def push(self, state_micro, action, reward, next_state_micro, current_seq, done, behavior_logp):
+    def push(self, state_micro, action, reward, next_state_micro, current_seq, done, behavior_logp,
+             pred_macro, pred_macro_next):
         # 存 CPU Tensor 以节省显存
-        self.buffer.append((state_micro, action, reward, next_state_micro, current_seq, done, behavior_logp))
+        self.buffer.append((state_micro, action, reward, next_state_micro, current_seq, done,
+                            behavior_logp, pred_macro, pred_macro_next))
 
     def sample(self, batch_size):
         batch = random.sample(self.buffer, batch_size)
-        state, action, reward, next_state, cur_seq, done, behavior_logp = zip(*batch)
+        (state, action, reward, next_state, cur_seq, done
+         , behavior_logp, pred_macro, pred_macro_next) = zip(*batch)
 
         # Pad cur_seq (因为 rollout 时长度不一)
         max_len = max([s.size(0) for s in cur_seq])
@@ -55,17 +61,26 @@ class ReplayBuffer:
 
         return (torch.stack(state), torch.tensor(action, dtype=torch.long), torch.tensor(reward, dtype=torch.float),
                 torch.stack(next_state), torch.stack(padded_seqs), torch.tensor(done, dtype=torch.float),
-                torch.tensor(behavior_logp, dtype=torch.float))
+                torch.tensor(behavior_logp, dtype=torch.float),
+                torch.tensor(pred_macro, dtype=torch.float),
+                torch.tensor(pred_macro_next, dtype=torch.float))
 
     def __len__(self):
         return len(self.buffer)
 
 
 # --- 辅助函数 ---
-def compute_reward(action, gt_set, pred_macro_size, gt_size, is_terminal,
-                   action_emb=None, gt_avg_emb=None):
-
+def compute_reward_with_shaping(action, gt_set, pred_macro_curr, pred_macro_next, gt_size, is_terminal,
+                   action_emb=None, gt_avg_emb=None, current_eta = opt.eta):
+    """
+    New reward with three parts:
+      1) micro immediate reward
+      2) potential-based shaping: eta * (gamma * Phi(next) - Phi(curr))
+      3) terminal macro reward (aligned with MSLE / relative error)
+    Phi(s) is chosen as negative absolute log-difference to gt_size (higher is better).
+    """
     reward = 0.0
+    shaping_discount = 1.0
 
     if action in gt_set:
         reward += 1.0
@@ -79,18 +94,24 @@ def compute_reward(action, gt_set, pred_macro_size, gt_size, is_terminal,
                 reward -= 0.05
         else:
             reward -= 0.1
+            shaping_discount = 0.1
+
+    gt = max(gt_size, 1.0)
+    def Phi(pred):
+        p = float(pred)
+        return - pow(math.log1p(p) - math.log1p(gt), 2)
+    phi_curr = Phi(pred_macro_curr)
+    phi_next = Phi(pred_macro_next)
+    shaping = current_eta * 0.1 * (opt.gamma * phi_next - phi_curr)
+    shaping = torch.clamp(torch.tensor(shaping), -0.1, 0.1).item()
+    reward += shaping * shaping_discount
 
     if is_terminal:
-        pred = max(pred_macro_size, 1.0)
-        gt = max(gt_size, 1.0)
-        # 使用相对误差而不是 Log 误差，对大数更敏感
-        error = abs(pred - gt) / (gt + 1.0)
-        # 限制惩罚上限，防止梯度爆炸
-        penalty = min(error, 2.0)
-        reward -= 0.5 * penalty
+        pred = max(pred_macro_next, 1.0)
+        msle_val = pow(math.log2(pred) - math.log2(max(gt_size, 1.0)), 2)
+        reward -= opt.alpha_macro * 0.05 * msle_val
 
     return reward
-
 
 def train_sl_step(model, batch, hypergraph_list, relation_graph, optimizer, device, user_size):
     """SL 单步训练"""
@@ -124,7 +145,7 @@ def train_sl_step(model, batch, hypergraph_list, relation_graph, optimizer, devi
     return loss.item(), n_correct, n_total
 
 
-def train_rl_step(model, train_loader, hypergraph_list, relation_graph, optimizer, buffer, device):
+def train_rl_step(model, train_loader, hypergraph_list, relation_graph, optimizer, buffer, device, current_eta):
     """RL 整个 Epoch 的训练 (包含 Rollout 和 Update)"""
     # ⚠️ 注意：RL 是一次性跑完整个 Loader 做 Rollout，然后 Update
     # 为了适配外层循环结构，我们在这里把逻辑写完整，外层直接调用
@@ -132,7 +153,11 @@ def train_rl_step(model, train_loader, hypergraph_list, relation_graph, optimize
     model.train()
     total_q_loss = 0
     total_pi_loss = 0
-    gamma = 0.99
+    total_phi = 0.0
+    total_terminal_msle = 0.0
+    update_count = 0
+    step_count = 0
+    terminal_count = 0
 
     with torch.no_grad():
         full_graph_emb = model.relationGNN(relation_graph).detach()
@@ -161,42 +186,74 @@ def train_rl_step(model, train_loader, hypergraph_list, relation_graph, optimize
         with torch.no_grad():
             for t in range(opt.rollout_steps):
                 logits, pred_macro, s_micro, _ = model.forward_step(hypergraph_list, relation_graph, curr_seq)
-                dist = Categorical(logits=logits)
+                mask = get_previous_user_mask(curr_seq, model.user_size).to(device)
+                masked_logits = logits + mask[:, -1, :]
+                dist = Categorical(logits=masked_logits)
                 actions = dist.sample()
                 behavior_logp = dist.log_prob(actions)
+
                 next_seq = torch.cat([curr_seq, actions.unsqueeze(1)], dim=1)
-                _, _, s_micro_next, _ = model.forward_step(hypergraph_list, relation_graph, next_seq)
+                _, pred_macro_next, s_micro_next, _ = model.forward_step(hypergraph_list, relation_graph, next_seq)
 
                 for i in range(bs):
                     is_terminal = (t == opt.rollout_steps - 1)
-                    act_emb = full_graph_emb[actions[i]]
-                    r = compute_reward(actions[i].item(), gt_sets[i],
-                                       pred_macro[i].item(), tgt_len[i].item(), is_terminal,
-                                       action_emb = act_emb, gt_avg_emb = gt_avg_embs[i])
-                    buffer.push(s_micro[i].cpu(), actions[i].cpu(), r,
-                                s_micro_next[i].cpu(), curr_seq[i].cpu(), is_terminal, behavior_logp[i].cpu())
-                curr_seq = next_seq
+                    act_idx = actions[i].item()
+                    act_emb = full_graph_emb[act_idx]
+                    r = compute_reward_with_shaping(
+                        action = act_idx, gt_set = gt_sets[i],
+                        pred_macro_curr=pred_macro[i].item(), pred_macro_next=pred_macro_next[i].item(),
+                        gt_size=tgt_len[i].item(), is_terminal=is_terminal, action_emb=act_emb,
+                        gt_avg_emb=gt_avg_embs[i],
+                        current_eta = current_eta
+                    )
+
+                    # calculate watching index
+                    gt_i = max(float(tgt_len[i].item()), 1.0)
+                    phi_curr = - abs(math.log1p(float(pred_macro[i].item())) - math.log1p(gt_i)) / math.log1p(gt_i)
+                    total_phi += phi_curr
+                    step_count += 1
+
+                    if is_terminal:
+                        msle_like = abs(math.log2(max(float(pred_macro_next[i].item()), 1.0)) - math.log2(gt_i))
+                        total_terminal_msle += msle_like
+                        terminal_count += 1
+
+                    buffer.push(
+                        s_micro[i].cpu(), actions[i].cpu(), r,
+                        s_micro_next[i].cpu(), curr_seq[i].cpu(), is_terminal,
+                        behavior_logp[i].cpu(),
+                        pred_macro[i].cpu(), pred_macro_next[i].cpu()
+                    )
 
         # 2. Update (Check Buffer Size)
         if len(buffer) < opt.batch_size: continue
 
-        b_s, b_a, b_r, b_s_next, b_cur_seq, b_d, b_logp = buffer.sample(opt.batch_size)
+        (b_s, b_a, b_r, b_s_next, b_cur_seq, b_d,
+            b_logp, b_pred_macro, b_pred_macro_next) = buffer.sample(opt.batch_size)
         b_s, b_a, b_r = b_s.to(device), b_a.to(device), b_r.to(device)
         b_s_next, b_cur_seq = b_s_next.to(device), b_cur_seq.to(device)
         b_d = b_d.float().to(device)
         b_logp = b_logp.to(device)
+        b_pred_macro = b_pred_macro.to(device)
+        b_pred_macro_next = b_pred_macro_next.to(device)
 
         current_graph_emb = model.relationGNN(relation_graph)
 
         # Critic Update
         with torch.no_grad():
-            logits_next = model.actor_head(b_s_next)
+            logits_next = model.actor_head(b_s_next) # actor (on next state)
             a_next = Categorical(logits=logits_next).sample()
-            target_q = model.critic_target(b_s_next, F.embedding(a_next, current_graph_emb),
-                            model.compute_explicit_features(b_cur_seq, a_next)).squeeze()
-            target = b_r + gamma * target_q * (1 - b_d)
+            norm_macro_next = torch.log2(b_pred_macro_next.unsqueeze(-1) + 1.0) / 7.0
+            s_aug_next = torch.cat([b_s_next, norm_macro_next], dim=-1)
+            target_q = model.critic_target(
+                s_aug_next,
+                F.embedding(a_next, current_graph_emb),
+                model.compute_explicit_features(b_cur_seq, a_next)
+            ).squeeze()
+            target = b_r + opt.gamma * target_q * (1 - b_d)
 
-        current_q = model.get_q_value(b_s, b_a, current_graph_emb, b_cur_seq).squeeze()
+        current_q = model.get_q_value_with_macro(
+            b_s, b_pred_macro, b_a, current_graph_emb, b_cur_seq).squeeze()
         loss_q = F.mse_loss(current_q, target)
 
         # Actor Update
@@ -205,11 +262,11 @@ def train_rl_step(model, train_loader, hypergraph_list, relation_graph, optimize
         log_prob_curr = dist_pi.log_prob(b_a)
         entropy = dist_pi.entropy().mean()
         ratio = torch.exp(log_prob_curr - b_logp)
-        ratio_clipped = torch.clamp(ratio, max=1.0)
+        ratio_clipped = torch.clamp(ratio, 0.8, 1.2)
         advantage = (target - current_q).detach() # Advantage: use TD-error (target - current_q) as advantage estimate
         advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-6)
         # Actor loss: weighted by clipped IS ratio and advantage
-        loss_pi = -(ratio_clipped * log_prob_curr * advantage).mean() - 0.01 * entropy
+        loss_pi = -(ratio_clipped * log_prob_curr * advantage).mean() - 0.05 * entropy
 
         loss = loss_q + loss_pi
         optimizer.zero_grad()
@@ -218,9 +275,15 @@ def train_rl_step(model, train_loader, hypergraph_list, relation_graph, optimize
         optimizer.step()
 
         model.soft_update_target() # Soft-update the critic_target so TD targets evolve smoothly
+        update_count += 1
         total_q_loss += loss_q.item()
         total_pi_loss += loss_pi.item()
-    return total_q_loss, total_pi_loss
+
+    avg_q = total_q_loss / (update_count + 1e-9)
+    avg_pi = total_pi_loss / (update_count + 1e-9)
+    avg_phi = total_phi / (step_count + 1e-9)
+    avg_msle = total_terminal_msle / (terminal_count + 1e-9)
+    return avg_q, avg_pi, avg_phi, avg_msle
 
 def MAE(y, y_predicted):
     y_predicted = y_predicted.squeeze()
@@ -245,28 +308,40 @@ def MSLE(y, y_predicted):
     return msle
 
 
+# def get_previous_user_mask(seq, user_size):
+#     ''' Mask previous activated users.'''
+#     assert seq.dim() == 2
+#     prev_shape = (seq.size(0), seq.size(1), seq.size(1))
+#     seqs = seq.repeat(1, 1, seq.size(1)).view(seq.size(0), seq.size(1), seq.size(1))
+#     previous_mask = np.tril(np.ones(prev_shape)).astype('float32')
+#     previous_mask = torch.from_numpy(previous_mask).to(seq.device)
+#     if seq.is_cuda:
+#         previous_mask = previous_mask.cuda()
+#     masked_seq = previous_mask * seqs.float()
+#
+#     # force the 0th dimension (PAD) to be masked
+#     PAD_tmp = torch.zeros(seq.size(0), seq.size(1), 1).to(seq.device)
+#     # if seq.is_cuda:
+#     #     PAD_tmp = PAD_tmp.cuda()
+#     masked_seq = torch.cat([masked_seq, PAD_tmp], dim=2)
+#     ans_tmp = torch.zeros(seq.size(0), seq.size(1), user_size).to(seq.device)
+#     # if seq.is_cuda:
+#     #     ans_tmp = ans_tmp.cuda()
+#     masked_seq = ans_tmp.scatter_(2, masked_seq.long(), float('-inf'))
+#     # print("masked_seq ",masked_seq.size())
+#     return masked_seq
 def get_previous_user_mask(seq, user_size):
-    ''' Mask previous activated users.'''
-    assert seq.dim() == 2
-    prev_shape = (seq.size(0), seq.size(1), seq.size(1))
-    seqs = seq.repeat(1, 1, seq.size(1)).view(seq.size(0), seq.size(1), seq.size(1))
-    previous_mask = np.tril(np.ones(prev_shape)).astype('float32')
-    previous_mask = torch.from_numpy(previous_mask)
-    if seq.is_cuda:
-        previous_mask = previous_mask.cuda()
-    masked_seq = previous_mask * seqs.data.float()
+    device = seq.device
+    batch_size, seq_len = seq.size()
+    mask = torch.zeros(batch_size, seq_len, user_size, device=device)
+    for t in range(seq_len):
+        # 提取当前时刻及之前出现过的用户
+        prefix_seq = seq[:, :t + 1]  # [B, t+1]
+        # 在第 t 个时刻的 mask 上，将 prefix_seq 包含的 ID 位置设为 -inf
+        mask[:, t, :].scatter_(1, prefix_seq.long(), float('-inf'))
+    mask[:, :, 0] = float('-inf')
 
-    # force the 0th dimension (PAD) to be masked
-    PAD_tmp = torch.zeros(seq.size(0), seq.size(1), 1)
-    # if seq.is_cuda:
-    #     PAD_tmp = PAD_tmp.cuda()
-    masked_seq = torch.cat([masked_seq, PAD_tmp], dim=2)
-    ans_tmp = torch.zeros(seq.size(0), seq.size(1), user_size)
-    # if seq.is_cuda:
-    #     ans_tmp = ans_tmp.cuda()
-    masked_seq = ans_tmp.scatter_(2, masked_seq.long(), float('-inf'))
-    # print("masked_seq ",masked_seq.size())
-    return masked_seq
+    return mask
 
 
 def get_performance(crit, pred, gold):
@@ -321,11 +396,14 @@ def train_epoch(model, train_loader, relation_graph, hypergraph_list, micro_loss
             for pg in optimizer.param_groups: pg['lr'] = opt.lr_rl
 
         # 调用 RL 训练逻辑 (该函数内部会遍历整个 loader 做 rollout)
-        q_loss, pi_loss = train_rl_step(model, train_loader, hypergraph_list, relation_graph, optimizer, buffer, device)
+        current_eta = opt.eta
+        if current_epoch_idx < int(opt.sl_epochs) + 5:
+            current_eta = 0.0
+        q_loss, pi_loss, phi_mean, terminal_msle = train_rl_step(model, train_loader, hypergraph_list, relation_graph, optimizer, buffer, device, current_eta)
 
         # RL 阶段 loss 含义变化，返回 total loss 供打印
         total_rl_loss = q_loss + pi_loss
-        print(f"   [RL Phase] Epoch {current_epoch_idx + 1} | Q-Loss: {q_loss:.4f} | Pi-Loss: {pi_loss:.4f}")
+        print(f"   [RL Phase] Epoch {current_epoch_idx + 1} | Q-Loss: {q_loss:.4f} | Pi-Loss: {pi_loss:.4f} Phi Mean: {phi_mean:.4f} Avg Terminal MSLE: {terminal_msle:.4f}")
 
         # RL 阶段不强制计算 Micro Accuracy，返回 0 或估算值
         return total_rl_loss, 0.0
