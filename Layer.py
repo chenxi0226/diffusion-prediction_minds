@@ -92,3 +92,34 @@ class LinearLayer(nn.Module):
             loss_l2 += torch.norm(self.U)**2/2 + torch.norm(self.b)**2/2
 
         return output, loss_l2
+
+
+class HGATLayer(nn.Module):
+    def __init__(self, in_dim, out_dim, dropout=0.5):
+        super().__init__()
+        self.dropout = nn.Dropout(dropout)
+        self.W_q = nn.Linear(in_dim, out_dim, bias=False)
+        self.a_ne = nn.Linear(out_dim, 1, bias=False)
+
+        # a2: 用于 Edge -> Node
+        self.a_en = nn.Linear(out_dim, 1, bias=False)
+
+        self.act = nn.LeakyReLU(0.2)
+
+    def forward(self, X, hg):
+        """
+        X: [N, C] 用户 Embedding
+        hg: dhg.Hypergraph 对象
+        """
+        X_trans = self.W_q(X)  # [N, out_dim]
+
+        Y_temp = hg.v2e(X_trans, aggr='mean')
+        e_weight = torch.sigmoid(self.a_ne(Y_temp))  # [M, 1] 边的权重
+        Y = hg.v2e(X_trans, aggr='mean') * e_weight  # [M, out_dim]
+
+        n_weight = torch.sigmoid(self.a_en(X_trans))  # [N, 1] 节点的接受门控
+
+        X_new = hg.e2v(Y, aggr='mean') * n_weight
+
+        X_out = self.act(X_new + X_trans)  # 残差连接防止梯度消失
+        return self.dropout(X_out)

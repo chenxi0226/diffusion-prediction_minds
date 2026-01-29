@@ -7,84 +7,49 @@ import torch.nn.functional as F
 from torch.distributions import Categorical
 from Layer import *
 
-class StructureAwareQCritic(nn.Module):
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=500):
+        super(PositionalEncoding, self).__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        # x: [batch, seq_len, d_model]
+        # pe: [max_len, d_model] -> [1, seq_len, d_model]
+        x = x + self.pe[:x.size(1), :].unsqueeze(0)
+        return x
+
+
+class RL_MINDS_v2(nn.Module):
     """
-    输入:
-      1. state_emb: SharedLSTM 输出的隐向量 (体现时序和语义)
-      2. action_emb: 候选动作的 Embedding
-      3. explicit_feats: [Connectivity_Score, Is_Infected] (体现拓扑因果性)
-    输出:
-      Q(s, a) 标量, 评估在状态 s 下采取动作 a (选择特定用户) 的价值。
+    最终整合模型：Macro-Guided + Dynamic Hypergraph Attention
     """
-    def __init__(self, state_dim, action_dim, hidden_dim=64):
-        super(StructureAwareQCritic, self).__init__()
-        # 输入维度 = 状态维度 + 动作维度 + 2个显式特征
-        self.input_dim = state_dim + action_dim + 2
 
-        self.net = nn.Sequential(
-            nn.Linear(self.input_dim, hidden_dim),
-            nn.LeakyReLU(0.2),  # LeakyRLU 对稀疏信号更友好
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, 1)  # Output Q-Value
-        )
-        self.init_weights()
-
-    def init_weights(self):
-        for m in self.net:
-            if isinstance(m, nn.Linear):
-                init.xavier_normal_(m.weight)
-
-    def forward(self, state_emb, action_emb, explicit_feats):
-        # state_emb: [B, D]
-        # action_emb: [B, D]
-        # explicit_feats: [B, 2]
-        x = torch.cat([state_emb, action_emb, explicit_feats], dim=-1)
-        return self.net(x)
-
-
-class RL_MINDS_StructureAware(nn.Module):
     def __init__(self, user_size, embed_dim, step_split=8, max_seq_len=200, device=torch.device('cuda')):
-        super(RL_MINDS_StructureAware, self).__init__()
+        super(RL_MINDS_v2, self).__init__()
         self.user_size = user_size
-        self.emb_dim = embed_dim
         self.device = device
 
-        # --- Encoders (核心表征层) ---
-        self.dycasHGNN = DynamicCasHGNN(user_size, embed_dim, step_split)
-        self.relationGNN = RelationGNN(user_size, embed_dim)
-        self.relationLSTM = RelationLSTM(embed_dim)
-        self.cascadeLSTM = CascadeLSTM(embed_dim)
-        self.sharedLSTM = SharedLSTM(max_seq_len, embed_dim)
+        # --- Encoders ---
+        # 1. 动态超图 (DyHGAT)
+        self.dycas_encoder = DynamicHGAT(user_size, embed_dim, step_split, is_norm=True)
+        # 2. 社交图 (RelationGNN)
+        self.social_encoder = RelationGNN(user_size, embed_dim, is_norm=True)
 
-        self.W_micro = nn.Linear(embed_dim, embed_dim)
-        self.W_macro = nn.Linear(embed_dim, embed_dim)
-
-        # --- Policy Head (微观预测头) ---
-        self.actor_head = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim),
-            nn.Tanh(),
-            nn.Linear(embed_dim, user_size)
-        )
-
-        # --- Macro Head (宏观规模头) ---
-        self.macro_head = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim // 2),
-            nn.ReLU(),
-            nn.Linear(embed_dim // 2, 1)
+        # --- Transformer Core ---
+        # 3. 宏观引导 Transformer
+        self.transformer = MacroGuidedTransformer(
+            user_size=user_size,
+            embed_dim=embed_dim,
+            num_heads=4,
+            max_seq_len=max_seq_len
         )
 
         self.adj_matrix = None
-        # ✅ 已修正：调用正确的初始化方法
-        self.init_weights()
-
-    def init_weights(self):
-        init.xavier_normal_(self.W_micro.weight)
-        init.xavier_normal_(self.W_macro.weight)
-        for m in self.actor_head:
-            if isinstance(m, nn.Linear): init.xavier_normal_(m.weight)
-        for m in self.macro_head:
-            if isinstance(m, nn.Linear): init.xavier_normal_(m.weight)
 
     def set_adjacency_matrix(self, relation_graph):
         if self.adj_matrix is not None: return
@@ -98,53 +63,90 @@ class RL_MINDS_StructureAware(nn.Module):
         except Exception:
             self.adj_matrix = None
 
-    def lookup_embedding(self, examples, embeddings):
-        examples = torch.clamp(examples, 0, embeddings.size(0) - 1)
-        return F.embedding(examples, embeddings)
+    def lookup_and_fuse(self, current_seq, graph_list, relation_graph):
+        """
+        辅助函数：获取图 Embedding 并融合
+        """
+        # 1. 获取全局图 Embedding
+        # [User, Dim]
+        cas_node_emb = self.dycas_encoder(graph_list, self.device)
+        social_node_emb = self.social_encoder(relation_graph)
 
-    def get_shared_state(self, graph_list, relation_graph, examples):
-        user_cas_embedding = self.dycasHGNN(graph_list, self.device)
-        user_social_embedding = self.relationGNN(relation_graph)
-        sender_cas_embedding_share = self.lookup_embedding(examples, user_cas_embedding)
-        sender_social_embedding_share = self.lookup_embedding(examples, user_social_embedding)
-        shared_embedding, _ = self.sharedLSTM(sender_cas_embedding_share, sender_social_embedding_share)
-        return shared_embedding, user_social_embedding
+        # 2. 简单加和融合 (也可以做 Concat + Linear)
+        # 这种 Early Fusion 让 Transformer 同时看到两类图的信息
+        global_node_emb = cas_node_emb + social_node_emb
+
+        # 3. Lookup 序列 Embedding
+        seq_emb = F.embedding(torch.clamp(current_seq, 0, self.user_size - 1), global_node_emb)
+        return seq_emb, global_node_emb
 
     def get_topological_mask(self, current_seq):
-        """核心：将搜索空间锁定在社交邻居内"""
+        """Mask 逻辑保持不变"""
         batch_size = current_seq.size(0)
         infected_mask = torch.zeros(batch_size, self.user_size, device=self.device)
         infected_mask.scatter_(1, current_seq, 1.0)
         infected_mask[:, 0] = 0
         if self.adj_matrix is not None:
-            # (Adj @ Infected.T).T -> 获取邻居
             neighbor_logits = torch.sparse.mm(self.adj_matrix, infected_mask.t()).t()
             topo_mask = torch.where(neighbor_logits > 0, 0.0, -1e9)
             topo_mask.scatter_(1, current_seq, -1e9)
             return topo_mask
         return torch.zeros(batch_size, self.user_size, device=self.device)
 
-    def forward_step(self, graph_list, relation_graph, current_seq):
-        if self.adj_matrix is None: self.set_adjacency_matrix(relation_graph)
-        shared_emb, graph_emb = self.get_shared_state(graph_list, relation_graph, current_seq)
-        s_t = shared_emb[:, -1, :]
-        s_micro = torch.tanh(self.W_micro(s_t))
-        s_macro = torch.tanh(self.W_macro(s_t))
-        logits = self.actor_head(s_micro)
-        topo_mask = self.get_topological_mask(current_seq)
-        pred_size = self.macro_head(s_macro)
-        return logits + topo_mask, pred_size, s_micro, graph_emb
+    def forward(self, graph_list, relation_graph, current_seq, gt_size=None, training_phase='SL'):
+        """
+        SL 训练全序列调用
+        """
+        # 1. 准备 Input Embedding
+        seq_emb, _ = self.lookup_and_fuse(current_seq, graph_list, relation_graph)
 
-    def forward(self, graph_list, relation_graph, examples):
-        shared_emb, _ = self.get_shared_state(graph_list, relation_graph, examples)
-        s_micro = torch.tanh(self.W_micro(shared_emb))
-        s_macro = torch.tanh(self.W_macro(shared_emb))
-        actor_logits = self.actor_head(s_micro)
-        batch_size = examples.size(0)
-        example_len = torch.count_nonzero(examples, 1)
-        s_macro_last = torch.stack([s_macro[i, max(0, example_len[i]-1), :] for i in range(batch_size)], dim=0)
-        pred_macro = self.macro_head(s_macro_last)
-        return actor_logits, pred_macro
+        # 2. Transformer 前向
+        # 返回: logits, log_size, hidden_state
+        actor_logits, pred_log_size, _ = self.transformer(
+            seq_emb, current_seq, gt_size, training_phase
+        )
+
+        # 3. 获取最后一个有效时间步的 Macro 预测 (用于 Loss)
+        batch_size = current_seq.size(0)
+        example_len = torch.count_nonzero(current_seq, 1)
+        pred_macro_final = []
+        for i in range(batch_size):
+            idx = max(0, example_len[i] - 1)
+            pred_macro_final.append(pred_log_size[i, idx, :])
+        pred_macro_final = torch.stack(pred_macro_final, dim=0)  # [Batch, 1]
+
+        # 还原 log2 -> scalar size (为了兼容 run.py 的接口)
+        pred_macro_scalar = torch.pow(2, pred_macro_final) - 1
+
+        return actor_logits, pred_macro_scalar
+
+    def forward_step(self, graph_list, relation_graph, current_seq):
+        """
+        RL Rollout 单步调用
+        """
+        if self.adj_matrix is None: self.set_adjacency_matrix(relation_graph)
+
+        # 1. 准备 Input
+        seq_emb, global_graph_emb = self.lookup_and_fuse(current_seq, graph_list, relation_graph)
+
+        # 2. Transformer 前向 (强制用自己的预测作为 Goal)
+        actor_logits, pred_log_size, micro_state = self.transformer(
+            seq_emb, current_seq, gt_size=None, training_phase='RL'
+        )
+
+        # 3. 取最后一个时间步的结果
+        last_logits = actor_logits[:, -1, :]  # [Batch, User]
+        last_log_size = pred_log_size[:, -1, :]  # [Batch, 1]
+        last_state = micro_state[:, -1, :]  # [Batch, Dim]
+
+        # 4. Mask
+        topo_mask = self.get_topological_mask(current_seq)
+        masked_logits = last_logits + topo_mask
+
+        pred_scalar = torch.pow(2, last_log_size) - 1
+
+        # 返回: logits, pred_size, state, graph_emb (兼容旧接口)
+        return masked_logits, pred_scalar, last_state, global_graph_emb
 
 class RelationGNN(nn.Module):
     '''社交图GNN'''
@@ -204,48 +206,77 @@ class Fusion(nn.Module):
         out = torch.sum(emb_score * emb, dim=0)  # 将输入的embedding和输出的embedding按照对应的用户加权求和
         return out
 
-class DynamicCasHGNN(nn.Module):
-    '''超图HGNN'''
+
+class DynamicHGAT(nn.Module):
+
     def __init__(self, input_num, embed_dim, step_split=8, dropout=0.5, is_norm=False):
-        '''
-        :param input_num: 用户个数
-        :param embed_dim: embedding维度
-        :param step_split: 超图序列中的超图个数
-        :param dropout: 丢弃率
-        :param is_norm: 是否规则化
-        '''
         super().__init__()
         self.input_num = input_num
         self.embed_dim = embed_dim
-        self.dropout = dropout
-        self.is_norm = is_norm
         self.step_split = step_split
-        if self.is_norm:
-            self.batch_norm = torch.nn.BatchNorm1d(self.embed_dim)
-        self.user_embeddings = nn.Embedding(self.input_num, self.embed_dim)
-        self.hgnn = HypergraphConv(self.embed_dim, self.embed_dim, drop_rate=self.dropout)  # 超图卷积，学习每个超图中的用户embedding
-        # self.lstm = nn.LSTM(self.embed_dim, self.embed_dim, num_layers=1, batch_first=True) # LSTM学习超图间的关系
-        self.fus = Fusion(embed_dim)
+
+        # 1. 基础 Embedding
+        self.user_embeddings = nn.Embedding(input_num, embed_dim)
+
+        # 2. 结构编码器 (HGAT)
+        # 使用两层 HGAT 提取高阶特征
+        self.hgat1 = HGATLayer(embed_dim, embed_dim, dropout)
+        self.hgat2 = HGATLayer(embed_dim, embed_dim, dropout)
+
+        # 3. 时序位置编码 (Learnable Time Embeddings)
+        # 为每一个快照 (Snapshot) 学习一个时间向量，替代 LSTM 的序列处理
+        self.time_embeddings = nn.Embedding(step_split + 1, embed_dim)
+
+        # 4. 融合层 (Snapshot Fusion)
+        # 将多个时间步的图特征融合为一个
+        self.fusion_attention = nn.Sequential(
+            nn.Linear(embed_dim, 1),
+            nn.Tanh()
+        )
+
+        self.norm = nn.LayerNorm(embed_dim) if is_norm else nn.Identity()
         self.reset_parameters()
 
     def reset_parameters(self):
-        '''从正态分布中随机初始化每张超图的初始用户embedding'''
         init.xavier_normal_(self.user_embeddings.weight)
+        init.xavier_normal_(self.time_embeddings.weight)
 
     def forward(self, hypergraph_list, device=torch.device('cuda')):
-        # 对每张子超图进行卷积
-        hg_embeddings = []
-        for i in range(len(hypergraph_list)):
-            subhg_embedding = self.hgnn(self.user_embeddings.weight, hypergraph_list[i])
-            if i == 0:
-                hg_embeddings.append(subhg_embedding)
-            else:
-                subhg_embedding = self.fus(hg_embeddings[-1], subhg_embedding)
-                hg_embeddings.append(subhg_embedding)
+        # 基础用户特征
+        base_emb = self.user_embeddings.weight  # [N, D]
 
-            # print(f'self.user_embeddings[{i}].weight = {self.user_embeddings[i].weight}')
-        # 返回最后一个时刻的用户embedding
-        return hg_embeddings[-1]
+        snapshot_embeddings = []
+
+        for t, hg in enumerate(hypergraph_list):
+            # 获取当前时间步的 Time Embedding
+            t_emb = self.time_embeddings(torch.tensor(t).to(device))  # [D]
+
+            # 将 Time Embedding 注入到用户特征中 (Broadcast add)
+            # 这样 HGAT 处理时就能感知这是“第几个阶段”的结构
+            x_t = base_emb + t_emb
+
+            # HGAT 卷积
+            x_t = self.hgat1(x_t, hg)
+            x_t = self.hgat2(x_t, hg)
+
+            snapshot_embeddings.append(x_t.unsqueeze(0))  # [1, N, D]
+
+        # Stack: [T, N, D]
+        all_snapshots = torch.cat(snapshot_embeddings, dim=0)
+
+        # --- Temporal Attention Fusion ---
+        # 我们不想只拿最后一个时刻 (LSTM style)，而是融合所有历史结构
+        # 计算每个快照的权重 alpha_t = softmax(w * x_t)
+        # [T, N, 1]
+        attn_scores = self.fusion_attention(all_snapshots)
+        # 对 T 维度做 Softmax -> [T, N, 1]
+        # 这意味着：对于用户 u，模型会自动判断他在 snapshot t 的结构特征是否重要
+        attn_weights = F.softmax(attn_scores, dim=0)
+
+        # 加权求和: sum(weight * emb) -> [N, D]
+        final_emb = torch.sum(all_snapshots * attn_weights, dim=0)
+
+        return self.norm(final_emb)
 
 class RelationLSTM(nn.Module):
     '''LSTM：对从社交图学到的用户embedding做LSTM'''
@@ -309,83 +340,89 @@ class CascadeLSTM(nn.Module):
 
         return output_embedding
 
-class SharedLSTM(nn.Module):
-    '''共享LSTM'''
-    def __init__(self, input_size, emb_dim):
-        '''
-        :param input_size: 一个级联序列中的用户个数，默认200
-        :param emb_dim: embedding维度
-        '''
-        super().__init__()
-        self.input_size = input_size
-        self.emb_dim = emb_dim
-        # 处理从级联图中学到的用户向量
-        self.W_i = nn.Parameter(torch.Tensor(emb_dim, emb_dim))
-        # 处理从社交图中学到的用户向量
-        self.U_i = nn.Parameter(torch.Tensor(emb_dim, emb_dim))
-        # 处理隐向量
-        self.V_i = nn.Parameter(torch.Tensor(emb_dim, emb_dim))
-        # 偏置
-        self.b_i = nn.Parameter(torch.Tensor(emb_dim))
+class MacroGuidedTransformer(nn.Module):
+    def __init__(self, user_size, embed_dim, num_heads=4, num_layers=2, dropout=0.1, max_seq_len=200):
+        super(MacroGuidedTransformer, self).__init__()
+        self.embed_dim = embed_dim
+        self.user_size = user_size
 
-        # 遗忘门 f_t
-        self.W_f = nn.Parameter(torch.Tensor(emb_dim, emb_dim))
-        self.U_f = nn.Parameter(torch.Tensor(emb_dim, emb_dim))
-        self.V_f = nn.Parameter(torch.Tensor(emb_dim, emb_dim))
-        self.b_f = nn.Parameter(torch.Tensor(emb_dim))
+        self.input_proj = nn.Linear(embed_dim, embed_dim)
+        self.pos_encoder = PositionalEncoding(embed_dim, max_seq_len)
 
-        # 输入门 c_t
-        self.W_c = nn.Parameter(torch.Tensor(emb_dim, emb_dim))
-        self.U_c = nn.Parameter(torch.Tensor(emb_dim, emb_dim))
-        self.V_c = nn.Parameter(torch.Tensor(emb_dim, emb_dim))
-        self.b_c = nn.Parameter(torch.Tensor(emb_dim))
+        encoder_layers = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=num_heads, dim_feedforward=embed_dim * 2,
+                                                    dropout=dropout, batch_first=True)
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers=num_layers)
 
-        # 输出门 o_t
-        self.W_o = nn.Parameter(torch.Tensor(emb_dim, emb_dim))
-        self.U_o = nn.Parameter(torch.Tensor(emb_dim, emb_dim))
-        self.V_o = nn.Parameter(torch.Tensor(emb_dim, emb_dim))
-        self.b_o = nn.Parameter(torch.Tensor(emb_dim))
+        self.macro_head = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.ReLU(),
+            nn.Linear(embed_dim, 1)  # 输出 log2(size)
+        )
 
-        self.init_weights()
+        self.goal_encoder = nn.Sequential(
+            nn.Linear(1, embed_dim),
+            nn.Tanh()  # 将数值转为 [-1, 1] 区间的特征
+        )
 
-    def init_weights(self):
-        stdv = 1.0 / math.sqrt(self.emb_dim)
-        for weight in self.parameters():
-            weight.data.uniform_(-stdv, stdv)
+        self.fusion_gate = nn.Linear(embed_dim * 2, embed_dim)
 
-    def forward(self, cas_emb, social_emb, init_states=None):
-        '''
-        :param cas_emb: 级联图HGNN 学来的用户embedding     (batch_size, 200, emb_dim)
-        :param social_emb: 社交图GNN 学来的用户embedding   (batch_size, 200, emb_dim)
-        :param init_states: 初始状态，可忽略
-        :return: hidden_seq: 最后一层的状态(batch_size, 200, emb_dim)
-        '''
-        bs, seq_sz, _ = cas_emb.size()    # (batch_size, 200, emb_dim)
-        hidden_seq = []
+        self.actor_head = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.LeakyReLU(),
+            nn.Linear(embed_dim, user_size)
+        )
 
-        if init_states is None:
-            h_t, c_t = (
-                torch.zeros(bs, self.emb_dim).to(cas_emb.device),
-                torch.zeros(bs, self.emb_dim).to(cas_emb.device)
-            )
+        self.dropout = nn.Dropout(dropout)
+        self._init_weights()
+
+    def _init_weights(self):
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+
+    def _generate_square_subsequent_mask(self, sz):
+        mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
+        mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
+        return mask
+
+    def forward(self, input_emb, current_seq, gt_size=None, training_phase='SL'):
+        device = input_emb.device
+        batch_size, seq_len, _ = input_emb.size()
+
+        src = self.input_proj(input_emb)
+        src = self.pos_encoder(src)
+
+        mask = self._generate_square_subsequent_mask(seq_len).to(device)
+
+        key_padding_mask = (current_seq == 0)
+
+        memory = self.transformer_encoder(src, mask=mask, src_key_padding_mask=key_padding_mask)
+
+        pred_log_size = self.macro_head(memory)  # [batch, seq_len, 1]
+
+        target_size_emb = None
+
+        if training_phase == 'SL' and gt_size is not None and self.training:
+            use_gt = torch.rand(1).item() < 0.5
+            if use_gt:
+                gt_log = torch.log2(gt_size.float() + 1).unsqueeze(1).unsqueeze(2).repeat(1, seq_len, 1).to(device)
+                target_signal = gt_log
+            else:
+                target_signal = pred_log_size.detach()  # 阻断梯度，让 Micro 只把 Goal 当条件，不强求 Micro 优化 Macro
         else:
-            h_t, c_t = init_states
-        for t in range(seq_sz):
-            cas_emb_t = cas_emb[:, t, :]
-            social_emb_t = social_emb[:, t, :]
+            target_signal = pred_log_size
 
-            i_t = torch.sigmoid(cas_emb_t @ self.W_i + social_emb_t @ self.U_i + h_t @ self.V_i + self.b_i)
-            f_t = torch.sigmoid(cas_emb_t @ self.W_f + social_emb_t @ self.U_f + h_t @ self.V_f + self.b_f)
-            g_t = torch.tanh(cas_emb_t @ self.W_c + social_emb_t @ self.U_c + h_t @ self.V_c + self.b_c)
-            o_t = torch.sigmoid(cas_emb_t @ self.W_o + social_emb_t @ self.U_o + h_t @ self.V_o + self.b_o)
-            c_t = f_t * c_t + i_t * g_t
-            h_t = o_t * torch.tanh(c_t)
+        goal_emb = self.goal_encoder(target_signal)  # [batch, seq_len, embed_dim]
 
-            hidden_seq.append(h_t.unsqueeze(0))
-        hidden_seq = torch.cat(hidden_seq, dim=0)
-        # reshape from shape(sequence, batch, feature) to (batch, sequence, feature)
-        hidden_seq = hidden_seq.transpose(0, 1).contiguous()
-        return hidden_seq, (h_t, c_t)
+        fusion_input = torch.cat([memory, goal_emb], dim=-1)
+        gate = torch.sigmoid(self.fusion_gate(fusion_input))
+
+        micro_state = memory * (1 - gate) + goal_emb * gate
+
+        actor_logits = self.actor_head(micro_state)  # [batch, seq_len, user_size]
+
+        return actor_logits, pred_log_size, micro_state
+
 
 class MLP(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim):
