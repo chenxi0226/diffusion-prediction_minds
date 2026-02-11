@@ -23,14 +23,123 @@ class PositionalEncoding(nn.Module):
         x = x + self.pe[:x.size(1), :].unsqueeze(0)
         return x
 
+class MacroOracle(nn.Module):
+    """
+    Environment Part: 宏观预测器。
+    在 RL 阶段，它的参数将被冻结 (requires_grad=False)，作为外生 Goal 生成器。
+    """
 
-class RL_MINDS_v2(nn.Module):
+    def __init__(self, embed_dim, num_heads=4, num_layers=2, dropout=0.1, max_seq_len=200):
+        super(MacroOracle, self).__init__()
+        self.input_proj = nn.Linear(embed_dim, embed_dim)
+        self.pos_encoder = PositionalEncoding(embed_dim, max_seq_len)
+
+        encoder_layers = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=num_heads,
+                                                    dim_feedforward=embed_dim * 2,
+                                                    dropout=dropout, batch_first=True)
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers=num_layers)
+
+        # 只预测规模，不预测动作
+        self.macro_head = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.ReLU(),
+            nn.Linear(embed_dim, 1)  # log2(size)
+        )
+
+    def forward(self, input_emb, current_seq):
+        # input_emb: [B, Seq, Dim]
+        src = self.input_proj(input_emb)
+        src = self.pos_encoder(src)
+
+        # Padding Mask
+        key_padding_mask = (current_seq == 0)
+
+        # Causal Mask (SL通常需要防止看到未来)
+        seq_len = src.size(1)
+        mask = torch.triu(torch.ones(seq_len, seq_len) == 1).transpose(0, 1).to(input_emb.device)
+        mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
+
+        memory = self.transformer_encoder(src, mask=mask, src_key_padding_mask=key_padding_mask)
+
+        # 简单取 Mean Pooling 或者 Last Valid State 来预测整体规模
+        # 这里为了稳定性，建议取 Mean Pooling (忽略 padding)
+        mask_expanded = (~key_padding_mask).unsqueeze(-1).float()  # [B, T, 1]
+        sum_embeddings = torch.sum(memory * mask_expanded, dim=1)
+        sum_mask = torch.clamp(mask_expanded.sum(1), min=1.0)
+        pooled_memory = sum_embeddings / sum_mask  # [B, Dim]
+
+        pred_log_size = self.macro_head(pooled_memory)  # [B, 1]
+        return pred_log_size
+
+
+class MicroPolicy(nn.Module):
+    """
+    RL Agent: 决策器。
+    接收: 历史 Embeddings + 外生目标 Goal (Scalar)
+    输出: 下一步动作 Logits
+    """
+
+    def __init__(self, user_size, embed_dim, num_heads=4, num_layers=2, dropout=0.1, max_seq_len=200):
+        super(MicroPolicy, self).__init__()
+        self.input_proj = nn.Linear(embed_dim, embed_dim)
+        self.pos_encoder = PositionalEncoding(embed_dim, max_seq_len)
+
+        encoder_layers = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=num_heads,
+                                                    dim_feedforward=embed_dim * 2,
+                                                    dropout=dropout, batch_first=True)
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers=num_layers)
+
+        # Goal 处理
+        self.goal_encoder = nn.Sequential(
+            nn.Linear(1, embed_dim),
+            nn.Tanh()
+        )
+        self.fusion_gate = nn.Linear(embed_dim * 2, embed_dim)
+
+        # Actor Head
+        self.actor_head = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.LeakyReLU(),
+            nn.Linear(embed_dim, user_size)
+        )
+
+    def forward(self, input_emb, current_seq, external_goal_log):
+        """
+        external_goal_log: [B, 1] 来自 MacroOracle 的 detach 过的预测值
+        """
+        src = self.input_proj(input_emb)
+        src = self.pos_encoder(src)
+
+        seq_len = src.size(1)
+        mask = torch.triu(torch.ones(seq_len, seq_len) == 1).transpose(0, 1).to(input_emb.device)
+        mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
+        key_padding_mask = (current_seq == 0)
+
+        memory = self.transformer_encoder(src, mask=mask, src_key_padding_mask=key_padding_mask)
+
+        # === Goal Conditioning ===
+        # 将 goal 扩展到序列长度
+        g_emb = self.goal_encoder(external_goal_log)  # [B, D]
+        g_emb = g_emb.unsqueeze(1).expand(-1, seq_len, -1)  # [B, T, D]
+
+        # Gate 融合
+        fusion_input = torch.cat([memory, g_emb], dim=-1)
+        gate = torch.sigmoid(self.fusion_gate(fusion_input))
+
+        # 融合状态
+        state = memory * (1 - gate) + g_emb * gate
+
+        logits = self.actor_head(state)
+        return logits, gate  # 返回 gate 用于监控是否塌缩
+
+
+class MyModule(nn.Module):
     """
     最终整合模型：Macro-Guided + Dynamic Hypergraph Attention
     """
 
     def __init__(self, user_size, embed_dim, step_split=8, max_seq_len=200, device=torch.device('cuda')):
-        super(RL_MINDS_v2, self).__init__()
+        super(MyModule, self).__init__()
         self.user_size = user_size
         self.device = device
 
@@ -42,12 +151,8 @@ class RL_MINDS_v2(nn.Module):
 
         # --- Transformer Core ---
         # 3. 宏观引导 Transformer
-        self.transformer = MacroGuidedTransformer(
-            user_size=user_size,
-            embed_dim=embed_dim,
-            num_heads=4,
-            max_seq_len=max_seq_len
-        )
+        self.macro_oracle = MacroOracle(embed_dim, max_seq_len=max_seq_len)
+        self.micro_policy = MicroPolicy(user_size, embed_dim, max_seq_len=max_seq_len)
 
         self.adj_matrix = None
 
@@ -93,60 +198,60 @@ class RL_MINDS_v2(nn.Module):
             return topo_mask
         return torch.zeros(batch_size, self.user_size, device=self.device)
 
-    def forward(self, graph_list, relation_graph, current_seq, gt_size=None, training_phase='SL'):
+    def freeze_oracle(self):
+        """核心：冻结 Oracle 参数"""
+        print(">>> Freezing MacroOracle...")
+        self.macro_oracle.eval()
+        for p in self.macro_oracle.parameters():
+            p.requires_grad = False
+
+    def forward_sl(self, graph_list, relation_graph, current_seq, gt_size=None):
         """
-        SL 训练全序列调用
+        SL 阶段：同时训练 Oracle 和 Policy (Warm Start)
         """
-        # 1. 准备 Input Embedding
         seq_emb, _ = self.lookup_and_fuse(current_seq, graph_list, relation_graph)
 
-        # 2. Transformer 前向
-        # 返回: logits, log_size, hidden_state
-        actor_logits, pred_log_size, _ = self.transformer(
-            seq_emb, current_seq, gt_size, training_phase
-        )
+        # 1. Oracle 预测 (用于 Loss_macro)
+        pred_log_size = self.macro_oracle(seq_emb, current_seq)
 
-        # 3. 获取最后一个有效时间步的 Macro 预测 (用于 Loss)
-        batch_size = current_seq.size(0)
-        example_len = torch.count_nonzero(current_seq, 1)
-        pred_macro_final = []
-        for i in range(batch_size):
-            idx = max(0, example_len[i] - 1)
-            pred_macro_final.append(pred_log_size[i, idx, :])
-        pred_macro_final = torch.stack(pred_macro_final, dim=0)  # [Batch, 1]
+        # 2. Policy 预测 (用于 Loss_micro)
+        # SL 阶段可以用 GT Size 或者 Pred Size 来训练 Policy
+        # 为了稳定性，SL 早期可以用 GT 注入 (Teacher Forcing)
+        if gt_size is not None and torch.rand(1).item() < 0.5:
+            target_signal = torch.log2(gt_size.float() + 1).unsqueeze(1).to(self.device)
+        else:
+            target_signal = pred_log_size.detach()  # SL阶段也建议detach，防止Policy梯度干扰Oracle
 
-        # 还原 log2 -> scalar size (为了兼容 run.py 的接口)
-        pred_macro_scalar = torch.pow(2, pred_macro_final) - 1
+        actor_logits, _ = self.micro_policy(seq_emb, current_seq, target_signal)
 
-        return actor_logits, pred_macro_scalar
+        pred_scalar = torch.pow(2, pred_log_size) - 1
+        return actor_logits, pred_scalar
 
-    def forward_step(self, graph_list, relation_graph, current_seq):
+    def get_initial_goal(self, graph_list, relation_graph, init_seq):
         """
-        RL Rollout 单步调用
+        RL 辅助：在 Episode 开始时生成一次 Goal
+        """
+        with torch.no_grad():
+            seq_emb, _ = self.lookup_and_fuse(init_seq, graph_list, relation_graph)
+            pred_log_size = self.macro_oracle(seq_emb, init_seq)
+        return pred_log_size.detach()  # 绝对阻断梯度
+
+    def forward_policy_step(self, graph_list, relation_graph, current_seq, fixed_goal_log):
+        """
+        RL 单步：只跑 Policy
         """
         if self.adj_matrix is None: self.set_adjacency_matrix(relation_graph)
 
-        # 1. 准备 Input
-        seq_emb, global_graph_emb = self.lookup_and_fuse(current_seq, graph_list, relation_graph)
+        seq_emb, global_emb = self.lookup_and_fuse(current_seq, graph_list, relation_graph)
 
-        # 2. Transformer 前向 (强制用自己的预测作为 Goal)
-        actor_logits, pred_log_size, micro_state = self.transformer(
-            seq_emb, current_seq, gt_size=None, training_phase='RL'
-        )
+        # Policy Forward
+        actor_logits, gate_val = self.micro_policy(seq_emb, current_seq, fixed_goal_log)
 
-        # 3. 取最后一个时间步的结果
-        last_logits = actor_logits[:, -1, :]  # [Batch, User]
-        last_log_size = pred_log_size[:, -1, :]  # [Batch, 1]
-        last_state = micro_state[:, -1, :]  # [Batch, Dim]
-
-        # 4. Mask
+        last_logits = actor_logits[:, -1, :]
         topo_mask = self.get_topological_mask(current_seq)
         masked_logits = last_logits + topo_mask
 
-        pred_scalar = torch.pow(2, last_log_size) - 1
-
-        # 返回: logits, pred_size, state, graph_emb (兼容旧接口)
-        return masked_logits, pred_scalar, last_state, global_graph_emb
+        return masked_logits, gate_val
 
 class RelationGNN(nn.Module):
     '''社交图GNN'''
@@ -339,90 +444,6 @@ class CascadeLSTM(nn.Module):
         output_embedding, (h_t, c_t) = self.lstm(cas_embedding)
 
         return output_embedding
-
-class MacroGuidedTransformer(nn.Module):
-    def __init__(self, user_size, embed_dim, num_heads=4, num_layers=2, dropout=0.1, max_seq_len=200):
-        super(MacroGuidedTransformer, self).__init__()
-        self.embed_dim = embed_dim
-        self.user_size = user_size
-
-        self.input_proj = nn.Linear(embed_dim, embed_dim)
-        self.pos_encoder = PositionalEncoding(embed_dim, max_seq_len)
-
-        encoder_layers = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=num_heads, dim_feedforward=embed_dim * 2,
-                                                    dropout=dropout, batch_first=True)
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers=num_layers)
-
-        self.macro_head = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim),
-            nn.ReLU(),
-            nn.Linear(embed_dim, 1)  # 输出 log2(size)
-        )
-
-        self.goal_encoder = nn.Sequential(
-            nn.Linear(1, embed_dim),
-            nn.Tanh()  # 将数值转为 [-1, 1] 区间的特征
-        )
-
-        self.fusion_gate = nn.Linear(embed_dim * 2, embed_dim)
-
-        self.actor_head = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim),
-            nn.LeakyReLU(),
-            nn.Linear(embed_dim, user_size)
-        )
-
-        self.dropout = nn.Dropout(dropout)
-        self._init_weights()
-
-    def _init_weights(self):
-        for p in self.parameters():
-            if p.dim() > 1:
-                nn.init.xavier_uniform_(p)
-
-    def _generate_square_subsequent_mask(self, sz):
-        mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
-        mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
-        return mask
-
-    def forward(self, input_emb, current_seq, gt_size=None, training_phase='SL'):
-        device = input_emb.device
-        batch_size, seq_len, _ = input_emb.size()
-
-        src = self.input_proj(input_emb)
-        src = self.pos_encoder(src)
-
-        mask = self._generate_square_subsequent_mask(seq_len).to(device)
-
-        key_padding_mask = (current_seq == 0)
-
-        memory = self.transformer_encoder(src, mask=mask, src_key_padding_mask=key_padding_mask)
-
-        pred_log_size = self.macro_head(memory)  # [batch, seq_len, 1]
-
-        target_size_emb = None
-
-        if training_phase == 'SL' and gt_size is not None and self.training:
-            use_gt = torch.rand(1).item() < 0.5
-            if use_gt:
-                gt_log = torch.log2(gt_size.float() + 1).unsqueeze(1).unsqueeze(2).repeat(1, seq_len, 1).to(device)
-                target_signal = gt_log
-            else:
-                target_signal = pred_log_size.detach()  # 阻断梯度，让 Micro 只把 Goal 当条件，不强求 Micro 优化 Macro
-        else:
-            target_signal = pred_log_size
-
-        goal_emb = self.goal_encoder(target_signal)  # [batch, seq_len, embed_dim]
-
-        fusion_input = torch.cat([memory, goal_emb], dim=-1)
-        gate = torch.sigmoid(self.fusion_gate(fusion_input))
-
-        micro_state = memory * (1 - gate) + goal_emb * gate
-
-        actor_logits = self.actor_head(micro_state)  # [batch, seq_len, user_size]
-
-        return actor_logits, pred_log_size, micro_state
-
 
 class MLP(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim):

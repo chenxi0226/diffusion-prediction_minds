@@ -17,112 +17,87 @@ from DataSet import *
 import Constants
 
 parser = argparse.ArgumentParser()
-parser.add_argument('-dataset_name', default='memetracker')
-parser.add_argument('-epoch', default=100)
+parser.add_argument('-dataset_name', default='christianity')
+parser.add_argument('-epoch', default=50)
 parser.add_argument('-batch_size', default=64)
-parser.add_argument('-emb_dim', default=64)
+parser.add_argument('-emb_dim', default=128)
 parser.add_argument('-train_rate', default=0.8)
 parser.add_argument('-valid_rate', default=0.1)
 parser.add_argument('-max_seq_length', default=200)
 parser.add_argument('-step_split', default=8)  # 级联超图的个数
 parser.add_argument('-lr', default=0.001)  # SL 学习率
-parser.add_argument('-lr_rl', default=0.00005)  # RL 学习率 (通常比SL小)
-parser.add_argument('-sl_epochs', default=1)  # SL 预训练轮数
-parser.add_argument('-rollout_steps', default=10)  # RL 探索步长
-parser.add_argument('-eta', default=0.1)  # 奖励相关系数
+parser.add_argument('-lr_rl', default=0.00001)  # RL 学习率 (通常比SL小)
+parser.add_argument('-sl_epochs', default=20)  # SL 预训练轮数
+parser.add_argument('-rollout_steps', default=15)  # RL 探索步长
+parser.add_argument('-eta', default=0.2)  # 奖励相关系数
 parser.add_argument('-gamma', default=0.99)  # RL 折扣因子
 
 opt = parser.parse_args()
 
-
-# --- RL Replay Buffer (占位，如果后续需要 Off-policy 可用) ---
-class ReplayBuffer:
-    def __init__(self, capacity=5000):
-        self.buffer = deque(maxlen=capacity)
-
-    def push(self, log_prob, reward, entropy):
-        self.buffer.append((log_prob, reward, entropy))
-
-    def clear(self):
-        self.buffer.clear()
-
-
-def compute_reward_advanced(action, gt_set, pred_macro_scalar, gt_size, is_terminal):
+def compute_reward_delta(action, gt_set, curr_size, goal_scalar, is_terminal, prev_dist):
     """
-    Advanced Reward: Macro-Guided Micro Reward
-    核心思想：微观的奖励受制于宏观的准确度。
-    只有当 Macro 预测比较准时，Micro 的命中才会有高分。
+    Reward = R_micro + eta * (Phi_{t-1} - Phi_t)
     """
-    # 1. Micro Base Reward (命中给分，未命中扣分)
+    # 1. Micro Reward (不再连坐)
     is_hit = action in gt_set
     r_micro = 2.0 if is_hit else -0.1
 
-    # 2. Macro Guidance Factor (宏观置信度)
-    # 计算预测规模与真实规模的对数距离
-    gt = max(float(gt_size), 1.0)
-    pred = max(float(pred_macro_scalar), 1.0)
+    # 2. Macro Progress Reward
+    # 目标是常数，curr_size 是当前真实大小
+    goal = max(float(goal_scalar), 1.0)
+    curr = max(float(curr_size), 1.0)
 
-    # MSLE 距离 (距离越大，Macro越不准)
-    dist = (math.log2(pred) - math.log2(gt)) ** 2
+    # 当前状态距离目标的“势能”
+    curr_dist = abs(math.log2(curr) - math.log2(goal))
 
-    # 引导因子：距离越小，因子越接近 1；距离越大，因子衰减接近 0。
-    # 强迫模型必须先把 Macro 预测准。
-    guidance_factor = math.exp(-dist * 0.5)
+    r_macro = 0.0
+    if prev_dist is not None:
+        # 如果距离变小了 (prev > curr)，奖励正分
+        r_macro = (prev_dist - curr_dist)
 
-    reward = r_micro * guidance_factor
+    # 组合
+    eta = 0.5  # 调节因子
+    reward = r_micro + eta * r_macro
 
-    # 3. 终端修正 (Terminal Correction)
-    # 在最后一步，额外奖励/惩罚最终的预测规模
+    # 3. Terminal Check (防止 Agent 走太远)
     if is_terminal:
-        # 如果最终预测规模很准，给予额外奖励
-        reward += 1.0 * guidance_factor
-        # 如果预测严重偏差，给予惩罚
-        reward -= 0.5 * dist
+        # 如果最终停下的位置和目标很接近，给大奖
+        if curr_dist < 0.5:
+            reward += 5.0
+        elif curr_dist > 2.0:
+            reward -= 2.0
 
-    return reward
+    return reward, curr_dist
 
 
 def train_sl_step(model, batch, hypergraph_list, relation_graph, optimizer, device, user_size):
-    """
-    SL 单步训练
-    关键点：传入 gt_size 并设置 training_phase='SL' 以启用 Goal Injection
-    """
     tgt, _, _, tgt_len = (item.to(device) for item in batch)
 
-    # 模型前向传播
-    # gt_size=tgt_len: 告诉模型真实长度，模型内部会随机决定是否用来指导 Transformer
-    actor_logits, pred_macro = model(
-        hypergraph_list, relation_graph, tgt,
-        gt_size=tgt_len,
-        training_phase='SL'
+    # Forward SL (同时训练 Oracle 和 Policy)
+    actor_logits, pred_macro = model.forward_sl(
+        hypergraph_list, relation_graph, tgt, gt_size=tgt_len
     )
 
-    # 1. Micro Loss (Predict Next User)
-    # Shift targets: Input [0...T-1], Target [1...T]
+    # 1. Micro Loss
     logits = actor_logits[:, :-1, :].reshape(-1, user_size)
     labels = tgt[:, 1:].reshape(-1)
+    loss_micro = F.cross_entropy(logits, labels, ignore_index=Constants.PAD)
 
-    criterion_ce = torch.nn.CrossEntropyLoss(ignore_index=Constants.PAD)
-    loss_micro = criterion_ce(logits, labels)
+    # 2. Macro Loss (Critical for Phase 1)
+    pred_log = torch.log2(pred_macro + 1)  # pred_macro 已经是 scalar
+    tgt_log = torch.log2(tgt_len.float() + 1).unsqueeze(1)  # [B, 1]
 
-    # 2. Macro Loss (Predict Size)
-    # 使用 Log 空间计算 MSE，防止数值过大
-    pred_log = torch.log2(pred_macro + 1)
-    tgt_log = torch.log2(tgt_len.float() + 1)
+    # 注意：这里的 pred_log 来源于 Oracle，labels 来源于 GT
+    loss_macro = F.mse_loss(pred_log, tgt_log)
 
-    criterion_mse = torch.nn.MSELoss()
-    loss_macro = criterion_mse(pred_log, tgt_log)
-
-    # 联合 Loss
-    loss = loss_micro + 0.5 * loss_macro  # 简单加权
+    loss = loss_micro + 1.0 * loss_macro
 
     optimizer.zero_grad()
     loss.backward()
-    # 梯度裁剪防止梯度爆炸 (特别是 Transformer)
     torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
     optimizer.step()
 
-    # 计算准确率供打印
+    # Metrics
     pred_idx = logits.max(1)[1]
     n_correct = pred_idx.eq(labels).masked_select(labels.ne(Constants.PAD)).sum().float()
     n_total = labels.ne(Constants.PAD).sum().float()
@@ -130,98 +105,98 @@ def train_sl_step(model, batch, hypergraph_list, relation_graph, optimizer, devi
     return loss.item(), n_correct, n_total
 
 
-def train_rl_step_minmal(model, train_loader, hypergraph_list, relation_graph, optimizer, buffer, device, current_eta):
-    """
-    RL 训练步骤：基于 Transformer 的 On-Policy Rollout (REINFORCE)
-    注意：这里使用了 batch 级更新，没有显式使用 buffer 进行多轮利用，保持策略稳定性。
-    """
-    model.train()  # 保持 Dropout 开启以增加随机性
+def train_rl_step_frozen_goal(model, train_loader, hypergraph_list, relation_graph, optimizer, device):
+    model.eval()  # 确保 Dropout 关闭 (RL通常在eval模式下采样，或者开着也可以，但这里为了稳定先关)
+    # 注意：model.macro_oracle 应该已经被 freeze_oracle() 处理过 requires_grad=False
+
     total_loss = 0
     batch_count = 0
-    entropy_weight = 0.05  # 熵正则化权重，鼓励探索
 
     for batch in train_loader:
         tgt, _, _, tgt_len = (item.to(device) for item in batch)
         bs = tgt.size(0)
 
-        # 随机截取一段作为初始状态 (Warm start)
+        # Warm Start 长度
         start_len = random.randint(2, 5)
         start_len = min(start_len, tgt.size(1) - 1)
-
         init_seq = tgt[:, :start_len]
         gt_sets = [set([u for u in t.cpu().numpy() if u != 0]) for t in tgt]
 
-        # === 1. Sampling (Explore / Rollout) ===
-        s_seq = init_seq.clone()
+        # === 1. Generate FROZEN Goal (Once per episode) ===
+        # 这个 goal_log 在接下来的 rollout 中绝对不变
+        fixed_goal_log = model.get_initial_goal(hypergraph_list, relation_graph, init_seq)
+        goal_scalars = torch.pow(2, fixed_goal_log).view(-1).cpu().numpy()  # 用于计算 Reward
+
+        # Init RL State
+        curr_seq = init_seq.clone()
+
+        # 计算初始距离 (Phi_0)
+        curr_sizes = [torch.count_nonzero(seq).item() for seq in curr_seq]
+        prev_dists = [abs(math.log2(max(c, 1)) - math.log2(max(g, 1))) for c, g in zip(curr_sizes, goal_scalars)]
+
         saved_log_probs = []
         saved_rewards = []
-        saved_entropies = []
 
-        # Rollout Loop
+        # === 2. Rollout Loop ===
         for t in range(opt.rollout_steps):
-            # 单步 Forward (RL 模式：Transformer 只能靠自己的 Macro 预测来指导 Micro)
-            logits, pred_scalar, _, _ = model.forward_step(hypergraph_list, relation_graph, s_seq)
+            # Policy Forward (Input: Seq + Fixed Goal)
+            logits, _ = model.forward_policy_step(hypergraph_list, relation_graph, curr_seq, fixed_goal_log)
 
-            # Action Selection
-            # 注意：logits 已经包含了 Topological Mask (在 forward_step 里)
             dist = Categorical(logits=logits)
             actions = dist.sample()
 
             saved_log_probs.append(dist.log_prob(actions))
-            saved_entropies.append(dist.entropy())
 
-            # Append action to sequence for next step
-            next_seq = torch.cat([s_seq, actions.unsqueeze(1)], dim=1)
+            # Env Step
+            next_seq = torch.cat([curr_seq, actions.unsqueeze(1)], dim=1)
 
-            # Get Reward based on Next State
-            # 我们需要知道动作做完后，宏观预测变成了什么
-            with torch.no_grad():
-                _, pred_next_scalar, _, _ = model.forward_step(hypergraph_list, relation_graph, next_seq)
-
+            # Compute Reward
             step_rewards = []
+            new_dists = []
+
             for i in range(bs):
-                # 使用 Advanced Reward Function
-                r = compute_reward_advanced(
+                # 真实演化的 Size
+                real_size = torch.count_nonzero(next_seq[i]).item()
+
+                r, new_d = compute_reward_delta(
                     actions[i].item(),
                     gt_sets[i],
-                    pred_next_scalar[i].item(),  # 使用动作后的预测值
-                    tgt_len[i].item(),
-                    is_terminal=(t == opt.rollout_steps - 1)
+                    real_size,
+                    goal_scalars[i],
+                    is_terminal=(t == opt.rollout_steps - 1),
+                    prev_dist=prev_dists[i]
                 )
                 step_rewards.append(r)
+                new_dists.append(new_d)
 
             saved_rewards.append(torch.tensor(step_rewards, device=device))
-            s_seq = next_seq
 
-        # === 2. Policy Update (REINFORCE with Baseline) ===
-        # 简单使用 batch 内均值作为 Baseline 减少方差
+            # Update State
+            curr_seq = next_seq
+            prev_dists = new_dists
+
+        # === 3. Update Policy (REINFORCE) ===
         R = torch.zeros(bs, device=device)
         policy_loss = []
 
-        # 反向计算累计回报
         for i in reversed(range(opt.rollout_steps)):
             R = opt.gamma * R + saved_rewards[i]
-            # Advantage = R - Baseline (Mean of batch)
-            advantage = R - R.mean()
-
-            # Loss = -log_prob * advantage
+            advantage = R - R.mean()  # Simple Baseline
             loss_step = -saved_log_probs[i] * advantage.detach()
-            # Entropy Bonus (Maximize entropy -> Minimize -entropy)
-            loss_ent = -entropy_weight * saved_entropies[i]
-
-            policy_loss.append(loss_step + loss_ent)
+            policy_loss.append(loss_step)
 
         final_loss = torch.stack(policy_loss).sum() / bs
 
         optimizer.zero_grad()
         final_loss.backward()
+        # 这里的梯度只会更新 MicroPolicy，因为 MacroOracle 被锁住了
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
 
         total_loss += final_loss.item()
         batch_count += 1
 
-    return total_loss / (batch_count + 1e-9), 0.0, 0.0, 0.0  # 保持返回值格式一致
+    return total_loss / (batch_count + 1e-9)
 
 
 def compute_metric(y_pred, y_gold, k_list):
@@ -296,47 +271,37 @@ def get_previous_user_mask(seq, user_size):
 
 def train_epoch(model, train_loader, relation_graph, hypergraph_list, micro_loss_func,
                 optimizer, lambda_loss, gamma_loss, user_size, device,
-                current_epoch_idx, buffer):
-    # === 策略切换逻辑 ===
-    if current_epoch_idx < int(opt.sl_epochs):
-        # === Phase 1: SL Mode ===
+                current_epoch_idx):
+    sl_epochs = int(opt.sl_epochs)
+
+    if current_epoch_idx < sl_epochs:
+        # Phase 1: SL (Train Oracle + Policy Warmup)
         model.train()
         total_loss = 0
-        n_correct_total = 0
-        n_words_total = 0
-
+        n_correct = 0
+        n_total = 0
         for batch in train_loader:
-            loss, n_correct, n_words = train_sl_step(model, batch, hypergraph_list, relation_graph, optimizer, device,
-                                                     user_size)
-            total_loss += loss
-            n_correct_total += n_correct
-            n_words_total += n_words
-
-        avg_loss = total_loss / len(train_loader)
-        accu = n_correct_total / (n_words_total + 1e-5)
-        print(f"   [SL Phase] Epoch {current_epoch_idx + 1} | Loss: {avg_loss:.4f} | Acc: {accu:.4f}")
-        return avg_loss, accu
+            l, c, t = train_sl_step(model, batch, hypergraph_list, relation_graph, optimizer, device, user_size)
+            total_loss += l
+            n_correct += c
+            n_total += t
+        print(
+            f"   [SL Phase] Epoch {current_epoch_idx + 1} | Loss: {total_loss:.4f} | Acc: {n_correct / (n_total + 1e-5):.4f}")
+        return total_loss, 0
 
     else:
-        # === Phase 2: RL Mode ===
-        # 第一次进入 RL Phase 时调整学习率 (简单的 Trick)
-        if current_epoch_idx == int(opt.sl_epochs):
-            print(">>> Switching to RL Phase! Reducing LR...")
+        # Phase 2: RL (Frozen Oracle)
+
+        # ★★★ One-time Freeze Trigger ★★★
+        if current_epoch_idx == sl_epochs:
+            print(">>> [System] Transitioning to RL Phase...")
+            model.freeze_oracle()  # 冻结 Macro
+            # 降低学习率，只微调 Policy
             for pg in optimizer.param_groups: pg['lr'] = opt.lr_rl
 
-        # 调用 RL 训练逻辑
-        current_eta = opt.eta
-        if current_epoch_idx < int(opt.sl_epochs) + 5:
-            current_eta = 0.0  # 预热期不使用 shaping reward
-
-        q_loss, pi_loss, phi_mean, terminal_msle = train_rl_step_minmal(model, train_loader, hypergraph_list,
-                                                                        relation_graph, optimizer, buffer, device,
-                                                                        current_eta)
-
-        # RL 阶段主要关注 Policy Loss
-        print(f"   [RL Phase] Epoch {current_epoch_idx + 1} | Policy-Loss: {q_loss:.4f}")
-
-        return q_loss, 0.0
+        loss = train_rl_step_frozen_goal(model, train_loader, hypergraph_list, relation_graph, optimizer, device)
+        print(f"   [RL Phase] Epoch {current_epoch_idx + 1} | Policy Loss: {loss:.4f}")
+        return loss, 0
 
 
 def test_epoch(model, data_loader, relation_graph, hypergraph_list, user_size, device, k_list=[10, 50, 100]):
@@ -351,11 +316,12 @@ def test_epoch(model, data_loader, relation_graph, hypergraph_list, user_size, d
             tgt, _, _, tgt_len = (item.to(device) for item in batch)
             y_gold = tgt[:, 1:].contiguous().view(-1).cpu().numpy()
 
-            # Forward with TEST phase (GT Size is hidden)
-            actor_logits, pred_macro = model(
+            # [MODIFY] 适配新接口：
+            # 使用 forward_sl，并且不传入 gt_size (设为 None)。
+            # 这样内部会自动使用 Oracle 的预测值作为 target_signal，模拟真实测试场景。
+            actor_logits, pred_macro = model.forward_sl(
                 hypergraph_list, relation_graph, tgt,
-                gt_size=None,
-                training_phase='TEST'
+                gt_size=None
             )
 
             # Masking previous users
@@ -371,6 +337,7 @@ def test_epoch(model, data_loader, relation_graph, hypergraph_list, user_size, d
                 scores[f'hits@{k}'] += batch_scores[f'hits@{k}'] * batch_len
                 scores[f'map@{k}'] += batch_scores[f'map@{k}'] * batch_len
 
+            # 计算 Macro MSLE 指标
             msle.append(MSLE(tgt_len, pred_macro))
 
     for k in k_list:
@@ -407,17 +374,15 @@ def main():
     relation_graph = RelationGraph(dataset, device)
     hypergraph_list = DynamicCasHypergraph(total_cascades, timestamps, user_size, device, step_split)
 
-    print(f"Initializing RL_MINDS_v2 (Macro-Guided)...")
-    # === 使用新模型 RL_MINDS_v2 ===
-    model = RL_MINDS_v2(
+    print(f"Initializing MyModule (Macro-Guided)...")
+    # === 使用新模型 MyModule ===
+    model = MyModule(
         user_size=user_size,
         embed_dim=opt.emb_dim,
         step_split=opt.step_split,
         max_seq_len=opt.max_seq_length,
         device=device
     ).to(device)
-
-    buffer = ReplayBuffer(capacity=5000)
 
     # micro_loss_func 在 train_sl_step 内部定义了，这里变量保留但不使用
     micro_loss_func = nn.CrossEntropyLoss(size_average=False, ignore_index=Constants.PAD)
@@ -450,7 +415,7 @@ def main():
                                              optimizer, opt.lambda_loss if hasattr(opt, 'lambda_loss') else 0.5,
                                              opt.gamma_loss if hasattr(opt, 'gamma_loss') else 0.05,
                                              user_size, device,
-                                             current_epoch_idx=epoch_i, buffer=buffer)
+                                             current_epoch_idx=epoch_i)
         end = time.time()
         print('===== Train')
         print(f'Mean Prediction loss at epoch {epoch_i + 1}: {loss}')
